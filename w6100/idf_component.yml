@@ -1,0 +1,7 @@
+version: 0.1.0
+description: W6100 Ethernet Driver
+url: https://github.com/espressif/esp-eth-drivers/tree/master/w6100
+dependencies:
+  idf: '>=5.3'
+examples:
+  - path: ../common_examples/
