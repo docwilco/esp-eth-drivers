@@ -16,6 +16,45 @@
 extern "C" {
 #endif
 
+/* Forward declaration */
+typedef struct emac_wiznet_s emac_wiznet_t;
+
+/**
+ * @brief Chip-specific operations structure for WIZnet Ethernet controllers
+ *
+ * This structure abstracts the register address and protocol differences
+ * between W5500, W6100, and other WIZnet chips, allowing shared TX/RX logic.
+ */
+typedef struct {
+    /* Register addresses (pre-computed for socket 0) */
+    uint32_t reg_sock_cr;           /*!< Socket command register */
+    uint32_t reg_sock_ir;           /*!< Socket interrupt register */
+    uint32_t reg_sock_tx_fsr;       /*!< Socket TX free size register */
+    uint32_t reg_sock_tx_wr;        /*!< Socket TX write pointer register */
+    uint32_t reg_sock_rx_rsr;       /*!< Socket RX received size register */
+    uint32_t reg_sock_rx_rd;        /*!< Socket RX read pointer register */
+    uint32_t reg_simr;              /*!< Socket interrupt mask register */
+
+    /* Memory address macros (offset added at runtime) */
+    uint32_t mem_sock_tx_base;      /*!< Socket TX buffer base (add offset to get address) */
+    uint32_t mem_sock_rx_base;      /*!< Socket RX buffer base (add offset to get address) */
+
+    /* Interrupt clear handling */
+    uint32_t reg_sock_irclr;        /*!< Socket interrupt clear register (same as IR for W5500) */
+
+    /* Command values */
+    uint8_t cmd_send;               /*!< Send command value */
+    uint8_t cmd_recv;               /*!< Receive command value */
+
+    /* Interrupt bits */
+    uint8_t sir_send;               /*!< Send complete interrupt bit */
+    uint8_t sir_recv;               /*!< Receive interrupt bit */
+    uint8_t simr_sock0;             /*!< Socket 0 interrupt mask bit */
+
+    /* Chip-specific callbacks */
+    bool (*is_sane_for_rxtx)(emac_wiznet_t *emac);  /*!< Check if PHY is ready for TX/RX */
+} wiznet_chip_ops_t;
+
 /**
  * @brief Common base structure for WIZnet EMAC implementations
  *
@@ -31,12 +70,13 @@ extern "C" {
  * } emac_w6100_t;
  * @endcode
  */
-typedef struct {
+struct emac_wiznet_s {
     esp_eth_mac_t parent;           /*!< ESP-IDF MAC vtable (must be first for __containerof) */
     esp_eth_mediator_t *eth;        /*!< Mediator for callbacks to ESP-ETH layer */
     eth_spi_custom_driver_t spi;    /*!< SPI driver interface */
     TaskHandle_t rx_task_hdl;       /*!< RX task handle */
     const char *tag;                /*!< Logging tag (e.g., "w6100.mac") */
+    const wiznet_chip_ops_t *ops;   /*!< Chip-specific operations */
     uint32_t sw_reset_timeout_ms;   /*!< Software reset timeout */
     int int_gpio_num;               /*!< Interrupt GPIO number, or -1 for polling mode */
     esp_timer_handle_t poll_timer;  /*!< Poll timer handle (polling mode only) */
@@ -45,7 +85,7 @@ typedef struct {
     bool packets_remain;            /*!< Flag indicating more packets in RX buffer */
     uint8_t *rx_buffer;             /*!< RX buffer for incoming frames */
     uint32_t tx_tmo;                /*!< TX timeout in microseconds (speed-dependent) */
-} emac_wiznet_t;
+};
 
 /**
  * @brief Set mediator for Ethernet MAC
@@ -140,6 +180,44 @@ void wiznet_isr_handler(void *arg);
  * @param arg Pointer to emac_wiznet_t instance
  */
 void wiznet_poll_timer(void *arg);
+
+/**
+ * @brief Common transmit function using chip ops
+ *
+ * Transmits an Ethernet frame using the chip-specific register addresses
+ * from the ops structure.
+ *
+ * @param mac Ethernet MAC instance
+ * @param buf Frame buffer to transmit
+ * @param length Frame length in bytes
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG if frame too large,
+ *         ESP_ERR_NO_MEM if TX buffer full, ESP_FAIL on timeout
+ */
+esp_err_t emac_wiznet_transmit(esp_eth_mac_t *mac, uint8_t *buf, uint32_t length);
+
+/**
+ * @brief Common receive function using chip ops
+ *
+ * Receives an Ethernet frame using the chip-specific register addresses
+ * from the ops structure.
+ *
+ * @param mac Ethernet MAC instance
+ * @param buf Buffer to store received frame
+ * @param[in,out] length On input, buffer size or 0 for auto-alloc mode;
+ *                       on output, actual frame length
+ * @return ESP_OK on success
+ */
+esp_err_t emac_wiznet_receive(esp_eth_mac_t *mac, uint8_t *buf, uint32_t *length);
+
+/**
+ * @brief Common RX task function using chip ops
+ *
+ * This is the main receive task loop that handles interrupts and receives
+ * frames. It uses chip-specific registers via the ops structure.
+ *
+ * @param arg Pointer to emac_wiznet_t instance
+ */
+void emac_wiznet_task(void *arg);
 
 #ifdef __cplusplus
 }

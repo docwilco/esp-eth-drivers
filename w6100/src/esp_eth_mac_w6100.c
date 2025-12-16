@@ -31,14 +31,6 @@ static const char *TAG = "w6100.mac";
 
 #define W6100_100M_TX_TMO_US (200)
 #define W6100_10M_TX_TMO_US (1500)
-#define W6100_ETH_MAC_RX_BUF_SIZE_AUTO (0)
-
-typedef struct {
-    uint32_t offset;
-    uint32_t copy_len;
-    uint32_t rx_len;
-    uint32_t remain;
-}__attribute__((packed)) emac_w6100_auto_buf_info_t;
 
 typedef struct {
     emac_wiznet_t base;  // Must be first member for safe casting
@@ -47,6 +39,53 @@ typedef struct {
     uint8_t mcast_v6_cnt;
 #endif
 } emac_w6100_t;
+
+/*******************************************************************************
+ * Chip-specific ops for W6100
+ ******************************************************************************/
+
+static bool is_w6100_sane_for_rxtx(emac_wiznet_t *emac);
+
+static const wiznet_chip_ops_t w6100_ops = {
+    /* Socket 0 registers (pre-computed addresses) */
+    .reg_sock_cr = W6100_REG_SOCK_CR(0),
+    .reg_sock_ir = W6100_REG_SOCK_IR(0),
+    .reg_sock_tx_fsr = W6100_REG_SOCK_TX_FSR(0),
+    .reg_sock_tx_wr = W6100_REG_SOCK_TX_WR(0),
+    .reg_sock_rx_rsr = W6100_REG_SOCK_RX_RSR(0),
+    .reg_sock_rx_rd = W6100_REG_SOCK_RX_RD(0),
+    .reg_simr = W6100_REG_SIMR,
+
+    /* Memory base addresses (offset added at runtime) */
+    .mem_sock_tx_base = W6100_MEM_SOCK_TX(0, 0),
+    .mem_sock_rx_base = W6100_MEM_SOCK_RX(0, 0),
+
+    /* W6100 uses separate IRCLR register to clear interrupts */
+    .reg_sock_irclr = W6100_REG_SOCK_IRCLR(0),
+
+    /* Command values */
+    .cmd_send = W6100_SCR_SEND,
+    .cmd_recv = W6100_SCR_RECV,
+
+    /* Interrupt bits */
+    .sir_send = W6100_SIR_SENDOK,
+    .sir_recv = W6100_SIR_RECV,
+    .simr_sock0 = W6100_SIMR_SOCK0,
+
+    /* Callbacks */
+    .is_sane_for_rxtx = is_w6100_sane_for_rxtx,
+};
+
+static bool is_w6100_sane_for_rxtx(emac_wiznet_t *emac)
+{
+    uint8_t physr;
+    /* PHY is ok for rx and tx operations if LNK bit is set */
+    if (emac->spi.read(emac->spi.ctx, (W6100_REG_PHYSR >> 16), (W6100_REG_PHYSR & 0xFFFF), &physr, 1) == ESP_OK 
+        && (physr & W6100_PHYSR_LNK)) {
+        return true;
+    }
+    return false;
+}
 
 static esp_err_t w6100_read(emac_w6100_t *emac, uint32_t address, void *data, uint32_t len)
 {
@@ -81,53 +120,6 @@ static esp_err_t w6100_send_command(emac_w6100_t *emac, uint8_t command, uint32_
     }
     ESP_GOTO_ON_FALSE(to < timeout_ms / 10, ESP_ERR_TIMEOUT, err, TAG, "send command timeout");
 
-err:
-    return ret;
-}
-
-static esp_err_t w6100_get_tx_free_size(emac_w6100_t *emac, uint16_t *size)
-{
-    esp_err_t ret = ESP_OK;
-    uint16_t free0, free1 = 0;
-    // read TX_FSR register more than once, until we get the same value
-    // this is a trick because we might be interrupted between reading the high/low part of the TX_FSR register (16 bits in length)
-    do {
-        ESP_GOTO_ON_ERROR(w6100_read(emac, W6100_REG_SOCK_TX_FSR(0), &free0, sizeof(free0)), err, TAG, "read TX FSR failed");
-        ESP_GOTO_ON_ERROR(w6100_read(emac, W6100_REG_SOCK_TX_FSR(0), &free1, sizeof(free1)), err, TAG, "read TX FSR failed");
-    } while (free0 != free1);
-
-    *size = __builtin_bswap16(free0);
-
-err:
-    return ret;
-}
-
-static esp_err_t w6100_get_rx_received_size(emac_w6100_t *emac, uint16_t *size)
-{
-    esp_err_t ret = ESP_OK;
-    uint16_t received0, received1 = 0;
-    do {
-        ESP_GOTO_ON_ERROR(w6100_read(emac, W6100_REG_SOCK_RX_RSR(0), &received0, sizeof(received0)), err, TAG, "read RX RSR failed");
-        ESP_GOTO_ON_ERROR(w6100_read(emac, W6100_REG_SOCK_RX_RSR(0), &received1, sizeof(received1)), err, TAG, "read RX RSR failed");
-    } while (received0 != received1);
-    *size = __builtin_bswap16(received0);
-
-err:
-    return ret;
-}
-
-static esp_err_t w6100_write_buffer(emac_w6100_t *emac, const void *buffer, uint32_t len, uint16_t offset)
-{
-    esp_err_t ret = ESP_OK;
-    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_MEM_SOCK_TX(0, offset), buffer, len), err, TAG, "write TX buffer failed");
-err:
-    return ret;
-}
-
-static esp_err_t w6100_read_buffer(emac_w6100_t *emac, void *buffer, uint32_t len, uint16_t offset)
-{
-    esp_err_t ret = ESP_OK;
-    ESP_GOTO_ON_ERROR(w6100_read(emac, W6100_MEM_SOCK_RX(0, offset), buffer, len), err, TAG, "read RX buffer failed");
 err:
     return ret;
 }
@@ -453,243 +445,6 @@ static esp_err_t emac_w6100_set_all_multicast(esp_eth_mac_t *mac, bool enable)
 }
 #endif // ESP_IDF_VERSION >= 6.0.0
 
-static inline bool is_w6100_sane_for_rxtx(emac_w6100_t *emac)
-{
-    uint8_t physr;
-    /* PHY is ok for rx and tx operations if LNK bit is set */
-    if (w6100_read(emac, W6100_REG_PHYSR, &physr, 1) == ESP_OK && (physr & W6100_PHYSR_LNK)) {
-        return true;
-    }
-    return false;
-}
-
-static esp_err_t emac_w6100_transmit(esp_eth_mac_t *mac, uint8_t *buf, uint32_t length)
-{
-    esp_err_t ret = ESP_OK;
-    emac_w6100_t *emac = __containerof(mac, emac_w6100_t, base.parent);
-    uint16_t offset = 0;
-
-    ESP_GOTO_ON_FALSE(length <= ETH_MAX_PACKET_SIZE, ESP_ERR_INVALID_ARG, err,
-                        TAG, "frame size is too big (actual %" PRIu32 ", maximum %u)", length, ETH_MAX_PACKET_SIZE);
-    // check if there're free memory to store this packet
-    uint16_t free_size = 0;
-    ESP_GOTO_ON_ERROR(w6100_get_tx_free_size(emac, &free_size), err, TAG, "get free size failed");
-    ESP_GOTO_ON_FALSE(length <= free_size, ESP_ERR_NO_MEM, err, TAG, "free size (%" PRIu16 ") < send length (%" PRIu32 ")", free_size, length);
-    // get current write pointer
-    ESP_GOTO_ON_ERROR(w6100_read(emac, W6100_REG_SOCK_TX_WR(0), &offset, sizeof(offset)), err, TAG, "read TX WR failed");
-    offset = __builtin_bswap16(offset);
-    // copy data to tx memory
-    ESP_GOTO_ON_ERROR(w6100_write_buffer(emac, buf, length, offset), err, TAG, "write frame failed");
-    // update write pointer
-    offset += length;
-    offset = __builtin_bswap16(offset);
-    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SOCK_TX_WR(0), &offset, sizeof(offset)), err, TAG, "write TX WR failed");
-    // issue SEND command
-    ESP_GOTO_ON_ERROR(w6100_send_command(emac, W6100_SCR_SEND, 100), err, TAG, "issue SEND command failed");
-
-    // polling the TX done event
-    uint8_t status = 0;
-    uint64_t start = esp_timer_get_time();
-    uint64_t now = 0;
-    do {
-        now = esp_timer_get_time();
-        if (!is_w6100_sane_for_rxtx(emac) || (now - start) > emac->base.tx_tmo) {
-            return ESP_FAIL;
-        }
-        ESP_GOTO_ON_ERROR(w6100_read(emac, W6100_REG_SOCK_IR(0), &status, sizeof(status)), err, TAG, "read SOCK0 IR failed");
-    } while (!(status & W6100_SIR_SENDOK));
-    // clear the event bit
-    status = W6100_SIR_SENDOK;
-    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SOCK_IRCLR(0), &status, sizeof(status)), err, TAG, "write SOCK0 IRCLR failed");
-
-err:
-    return ret;
-}
-
-static esp_err_t emac_w6100_alloc_recv_buf(emac_w6100_t *emac, uint8_t **buf, uint32_t *length)
-{
-    esp_err_t ret = ESP_OK;
-    uint16_t offset = 0;
-    uint16_t rx_len = 0;
-    uint32_t copy_len = 0;
-    uint16_t remain_bytes = 0;
-    *buf = NULL;
-
-    w6100_get_rx_received_size(emac, &remain_bytes);
-    if (remain_bytes) {
-        // get current read pointer
-        ESP_GOTO_ON_ERROR(w6100_read(emac, W6100_REG_SOCK_RX_RD(0), &offset, sizeof(offset)), err, TAG, "read RX RD failed");
-        offset = __builtin_bswap16(offset);
-        // read head
-        ESP_GOTO_ON_ERROR(w6100_read_buffer(emac, &rx_len, sizeof(rx_len), offset), err, TAG, "read frame header failed");
-        rx_len = __builtin_bswap16(rx_len) - 2; // data size includes 2 bytes of header
-        // frames larger than expected will be truncated
-        copy_len = rx_len > *length ? *length : rx_len;
-        // runt frames are not forwarded by W6100, but check the length anyway since it could be corrupted at SPI bus
-        ESP_GOTO_ON_FALSE(copy_len >= ETH_MIN_PACKET_SIZE - ETH_CRC_LEN, ESP_ERR_INVALID_SIZE, err, TAG, "invalid frame length %" PRIu32, copy_len);
-        *buf = malloc(copy_len);
-        if (*buf != NULL) {
-            emac_w6100_auto_buf_info_t *buff_info = (emac_w6100_auto_buf_info_t *)*buf;
-            buff_info->offset = offset;
-            buff_info->copy_len = copy_len;
-            buff_info->rx_len = rx_len;
-            buff_info->remain = remain_bytes;
-        } else {
-            ret = ESP_ERR_NO_MEM;
-            goto err;
-        }
-    }
-err:
-    *length = rx_len;
-    return ret;
-}
-
-static esp_err_t emac_w6100_receive(esp_eth_mac_t *mac, uint8_t *buf, uint32_t *length)
-{
-    esp_err_t ret = ESP_OK;
-    emac_w6100_t *emac = __containerof(mac, emac_w6100_t, base.parent);
-    uint16_t offset = 0;
-    uint16_t rx_len = 0;
-    uint16_t copy_len = 0;
-    uint16_t remain_bytes = 0;
-    emac->base.packets_remain = false;
-
-    if (*length != W6100_ETH_MAC_RX_BUF_SIZE_AUTO) {
-        w6100_get_rx_received_size(emac, &remain_bytes);
-        if (remain_bytes) {
-            // get current read pointer
-            ESP_GOTO_ON_ERROR(w6100_read(emac, W6100_REG_SOCK_RX_RD(0), &offset, sizeof(offset)), err, TAG, "read RX RD failed");
-            offset = __builtin_bswap16(offset);
-            // read head first
-            ESP_GOTO_ON_ERROR(w6100_read_buffer(emac, &rx_len, sizeof(rx_len), offset), err, TAG, "read frame header failed");
-            rx_len = __builtin_bswap16(rx_len) - 2; // data size includes 2 bytes of header
-            // frames larger than expected will be truncated
-            copy_len = rx_len > *length ? *length : rx_len;
-        } else {
-            // silently return when no frame is waiting
-            goto err;
-        }
-    } else {
-        emac_w6100_auto_buf_info_t *buff_info = (emac_w6100_auto_buf_info_t *)buf;
-        offset = buff_info->offset;
-        copy_len = buff_info->copy_len;
-        rx_len = buff_info->rx_len;
-        remain_bytes = buff_info->remain;
-    }
-    // 2 bytes of header
-    offset += 2;
-    // read the payload
-    ESP_GOTO_ON_ERROR(w6100_read_buffer(emac, emac->base.rx_buffer, copy_len, offset), err, TAG, "read payload failed, len=%" PRIu16 ", offset=%" PRIu16, rx_len, offset);
-    memcpy(buf, emac->base.rx_buffer, copy_len);
-    offset += rx_len;
-    // update read pointer
-    offset = __builtin_bswap16(offset);
-    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SOCK_RX_RD(0), &offset, sizeof(offset)), err, TAG, "write RX RD failed");
-    /* issue RECV command */
-    ESP_GOTO_ON_ERROR(w6100_send_command(emac, W6100_SCR_RECV, 100), err, TAG, "issue RECV command failed");
-    // check if there're more data need to process
-    remain_bytes -= rx_len + 2;
-    emac->base.packets_remain = remain_bytes > 0;
-
-    *length = copy_len;
-    return ret;
-err:
-    *length = 0;
-    return ret;
-}
-
-static esp_err_t emac_w6100_flush_recv_frame(emac_w6100_t *emac)
-{
-    esp_err_t ret = ESP_OK;
-    uint16_t offset = 0;
-    uint16_t rx_len = 0;
-    uint16_t remain_bytes = 0;
-    emac->base.packets_remain = false;
-
-    w6100_get_rx_received_size(emac, &remain_bytes);
-    if (remain_bytes) {
-        // get current read pointer
-        ESP_GOTO_ON_ERROR(w6100_read(emac, W6100_REG_SOCK_RX_RD(0), &offset, sizeof(offset)), err, TAG, "read RX RD failed");
-        offset = __builtin_bswap16(offset);
-        // read head first
-        ESP_GOTO_ON_ERROR(w6100_read_buffer(emac, &rx_len, sizeof(rx_len), offset), err, TAG, "read frame header failed");
-        // update read pointer
-        rx_len = __builtin_bswap16(rx_len);
-        offset += rx_len;
-        offset = __builtin_bswap16(offset);
-        ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SOCK_RX_RD(0), &offset, sizeof(offset)), err, TAG, "write RX RD failed");
-        /* issue RECV command */
-        ESP_GOTO_ON_ERROR(w6100_send_command(emac, W6100_SCR_RECV, 100), err, TAG, "issue RECV command failed");
-        // check if there're more data need to process
-        remain_bytes -= rx_len;
-        emac->base.packets_remain = remain_bytes > 0;
-    }
-err:
-    return ret;
-}
-
-static void emac_w6100_task(void *arg)
-{
-    emac_w6100_t *emac = (emac_w6100_t *)arg;
-    uint8_t status = 0;
-    uint8_t *buffer = NULL;
-    uint32_t frame_len = 0;
-    uint32_t buf_len = 0;
-    esp_err_t ret;
-    while (1) {
-        /* check if the task receives any notification */
-        if (emac->base.int_gpio_num >= 0) {                                   // if in interrupt mode
-            if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000)) == 0 &&   // if no notification ...
-                gpio_get_level(emac->base.int_gpio_num) != 0) {               // ...and no interrupt asserted
-                continue;                                                // -> just continue to check again
-            }
-        } else {
-            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        }
-        /* read interrupt status */
-        w6100_read(emac, W6100_REG_SOCK_IR(0), &status, sizeof(status));
-        /* packet received */
-        if (status & W6100_SIR_RECV) {
-            /* clear interrupt status */
-            uint8_t clr = W6100_SIR_RECV;
-            w6100_write(emac, W6100_REG_SOCK_IRCLR(0), &clr, sizeof(clr));
-            do {
-                /* define max expected frame len */
-                frame_len = ETH_MAX_PACKET_SIZE;
-                if ((ret = emac_w6100_alloc_recv_buf(emac, &buffer, &frame_len)) == ESP_OK) {
-                    if (buffer != NULL) {
-                        /* we have memory to receive the frame of maximal size previously defined */
-                        buf_len = W6100_ETH_MAC_RX_BUF_SIZE_AUTO;
-                        if (emac->base.parent.receive(&emac->base.parent, buffer, &buf_len) == ESP_OK) {
-                            if (buf_len == 0) {
-                                free(buffer);
-                            } else if (frame_len > buf_len) {
-                                ESP_LOGE(TAG, "received frame was truncated");
-                                free(buffer);
-                            } else {
-                                ESP_LOGD(TAG, "receive len=%" PRIu32, buf_len);
-                                /* pass the buffer to stack (e.g. TCP/IP layer) */
-                                emac->base.eth->stack_input(emac->base.eth, buffer, buf_len);
-                            }
-                        } else {
-                            ESP_LOGE(TAG, "frame read from module failed");
-                            free(buffer);
-                        }
-                    } else if (frame_len) {
-                        ESP_LOGE(TAG, "invalid combination of frame_len(%" PRIu32 ") and buffer pointer(%p)", frame_len, buffer);
-                    }
-                } else if (ret == ESP_ERR_NO_MEM) {
-                    ESP_LOGE(TAG, "no mem for receive buffer");
-                    emac_w6100_flush_recv_frame(emac);
-                } else {
-                    ESP_LOGE(TAG, "unexpected error 0x%x", ret);
-                }
-            } while (emac->base.packets_remain);
-        }
-    }
-    vTaskDelete(NULL);
-}
-
 static esp_err_t emac_w6100_init(esp_eth_mac_t *mac)
 {
     esp_err_t ret = ESP_OK;
@@ -732,6 +487,7 @@ esp_eth_mac_t *esp_eth_mac_new_w6100(const eth_w6100_config_t *w6100_config, con
     ESP_GOTO_ON_FALSE(emac, NULL, err, TAG, "no mem for MAC instance");
     /* bind methods and attributes */
     emac->base.tag = TAG;
+    emac->base.ops = &w6100_ops;
     emac->base.sw_reset_timeout_ms = mac_config->sw_reset_timeout_ms;
     emac->base.tx_tmo = W6100_100M_TX_TMO_US;  // default to 100Mbps timeout
     emac->base.int_gpio_num = w6100_config->int_gpio_num;
@@ -757,8 +513,8 @@ esp_eth_mac_t *esp_eth_mac_new_w6100(const eth_w6100_config_t *w6100_config, con
 #endif
     emac->base.parent.set_peer_pause_ability = emac_wiznet_set_peer_pause_ability;
     emac->base.parent.enable_flow_ctrl = emac_wiznet_enable_flow_ctrl;
-    emac->base.parent.transmit = emac_w6100_transmit;
-    emac->base.parent.receive = emac_w6100_receive;
+    emac->base.parent.transmit = emac_wiznet_transmit;
+    emac->base.parent.receive = emac_wiznet_receive;
 
     if (w6100_config->custom_spi_driver.init != NULL && w6100_config->custom_spi_driver.deinit != NULL
             && w6100_config->custom_spi_driver.read != NULL && w6100_config->custom_spi_driver.write != NULL) {
@@ -784,7 +540,7 @@ esp_eth_mac_t *esp_eth_mac_new_w6100(const eth_w6100_config_t *w6100_config, con
     if (mac_config->flags & ETH_MAC_FLAG_PIN_TO_CORE) {
         core_num = esp_cpu_get_core_id();
     }
-    BaseType_t xReturned = xTaskCreatePinnedToCore(emac_w6100_task, "w6100_tsk", mac_config->rx_task_stack_size, emac,
+    BaseType_t xReturned = xTaskCreatePinnedToCore(emac_wiznet_task, "w6100_tsk", mac_config->rx_task_stack_size, emac,
                            mac_config->rx_task_prio, &emac->base.rx_task_hdl, core_num);
     ESP_GOTO_ON_FALSE(xReturned == pdPASS, NULL, err, TAG, "create w6100 task failed");
 
