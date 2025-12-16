@@ -14,7 +14,7 @@
 #include "driver/gpio.h"
 #include "esp_rom_gpio.h"
 #include "esp_rom_sys.h"
-#include "w6100_regs.h"
+#include "w6100.h"
 
 #define W6100_WAIT_FOR_RESET_MS (10) // wait for W6100 internal PHY after reset
 

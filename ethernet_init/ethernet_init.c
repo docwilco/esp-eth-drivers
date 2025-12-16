@@ -54,7 +54,8 @@
 #endif // CONFIG_ETHERNET_SPI_USE_W5500
 
 #if CONFIG_ETHERNET_SPI_USE_W6100
-#include "w6100.h"
+#include "esp_eth_mac_w6100.h"
+#include "esp_eth_phy_w6100.h"
 #endif // CONFIG_ETHERNET_SPI_USE_W6100
 
 #if CONFIG_ETHERNET_PHY_IP101

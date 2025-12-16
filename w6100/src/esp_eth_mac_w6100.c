@@ -21,8 +21,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "esp_eth_mac_w6100.h"
 #include "w6100.h"
-#include "w6100_regs.h"
 
 static const char *TAG = "w6100.mac";
 
