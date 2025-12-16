@@ -413,64 +413,30 @@
 #define W6100_SIMR_SOCK0    (1 << 0)  // Socket 0 interrupt mask
 
 /**
- * @brief Socket Mode Register (Sn_MR) bits
+ * @brief Socket Mode Register (Sn_MR) bits for MACRAW mode Note: This driver
+ * only uses a single socket in MACRAW mode. Other modes like TCP/UDP have
+ * different bit meanings at the same positions.
  */
-#define W6100_SMR_MULTI     (1 << 7)  // Multicast (UDP mode)
-#define W6100_SMR_MF        (1 << 6)  // MAC Filter (MACRAW mode)
-#define W6100_SMR_BRDB      (1 << 6)  // Broadcast block (UDP mode)
-#define W6100_SMR_ND        (1 << 5)  // No Delayed ACK (TCP mode)
-#define W6100_SMR_UNIB      (1 << 4)  // Unicast block (UDP multicast)
-#define W6100_SMR_MMB       (1 << 5)  // Multicast block (MACRAW)
-#define W6100_SMR_MMB6      (1 << 4)  // IPv6 Multicast block (MACRAW)
+#define W6100_SMR_MF        (1 << 7)  // MAC Filter: 0=recv all, 1=filter by SHAR/bcast/mcast
+#define W6100_SMR_MMB       (1 << 5)  // IPv4 Multicast Block: 0=recv, 1=block
+#define W6100_SMR_MMB6      (1 << 4)  // IPv6 Multicast Block: 0=recv, 1=block
+#define W6100_SMR_MACRAW    (0x07)    // MACRAW protocol mode
 
 /**
- * @brief Socket Mode Register Protocol types (Sn_MR[3:0])
+ * @brief Socket Command Register (Sn_CR) commands for MACRAW mode
  */
-#define W6100_SMR_CLOSED    (0x00)  // Socket Closed
-#define W6100_SMR_TCP4      (0x01)  // TCP IPv4 mode
-#define W6100_SMR_UDP4      (0x02)  // UDP IPv4 mode
-#define W6100_SMR_IPRAW4    (0x03)  // IPRAW IPv4 mode
-#define W6100_SMR_MACRAW    (0x07)  // MACRAW mode (Socket 0 only)
-#define W6100_SMR_TCP6      (0x09)  // TCP IPv6 mode
-#define W6100_SMR_UDP6      (0x0A)  // UDP IPv6 mode
-#define W6100_SMR_IPRAW6    (0x0B)  // IPRAW IPv6 mode
-#define W6100_SMR_TCPD      (0x0D)  // TCP Dual Stack mode
-#define W6100_SMR_UDPD      (0x0E)  // UDP Dual Stack mode
-
-/**
- * @brief Socket Command Register (Sn_CR) commands
- */
-#define W6100_SCR_OPEN      (0x01)  // Open
-#define W6100_SCR_LISTEN    (0x02)  // Listen (TCP Server)
-#define W6100_SCR_CONNECT   (0x04)  // Connect (TCP Client IPv4)
-#define W6100_SCR_CONNECT6  (0x84)  // Connect6 (TCP Client IPv6)
-#define W6100_SCR_DISCON    (0x08)  // Disconnect
-#define W6100_SCR_CLOSE     (0x10)  // Close
-#define W6100_SCR_SEND      (0x20)  // Send (IPv4)
-#define W6100_SCR_SEND6     (0xA0)  // Send6 (IPv6)
-#define W6100_SCR_SEND_KEEP (0x22)  // Send Keep-alive
-#define W6100_SCR_RECV      (0x40)  // Receive
+#define W6100_SCR_OPEN      (0x01)  // Open socket
+#define W6100_SCR_CLOSE     (0x10)  // Close socket
+#define W6100_SCR_SEND      (0x20)  // Send data from TX buffer
+#define W6100_SCR_RECV      (0x40)  // Update RX read pointer after reading
 
 /**
  * @brief Socket Interrupt Register (Sn_IR) bits
+ * Note: MACRAW mode uses RECV (for RX notification) and SENDOK (to confirm TX).
+ * TIMEOUT/CON/DISCON are for TCP/UDP connection management.
  */
-#define W6100_SIR_SENDOK    (1 << 4)  // Send OK
-#define W6100_SIR_TIMEOUT   (1 << 3)  // Timeout
-#define W6100_SIR_RECV      (1 << 2)  // Receive
-#define W6100_SIR_DISCON    (1 << 1)  // Disconnect
-#define W6100_SIR_CON       (1 << 0)  // Connect
-
-/**
- * @brief Socket Status Register (Sn_SR) values
- */
-#define W6100_SSR_CLOSED        (0x00)  // Socket Closed
-#define W6100_SSR_INIT          (0x13)  // Socket Init (TCP)
-#define W6100_SSR_LISTEN        (0x14)  // Socket Listen (TCP Server)
-#define W6100_SSR_ESTABLISHED   (0x17)  // Socket Established (TCP)
-#define W6100_SSR_CLOSE_WAIT    (0x1C)  // Socket Close Wait (TCP)
-#define W6100_SSR_UDP           (0x22)  // Socket UDP
-#define W6100_SSR_IPRAW         (0x32)  // Socket IPRAW
-#define W6100_SSR_MACRAW        (0x42)  // Socket MACRAW
+#define W6100_SIR_SENDOK    (1 << 4)  // Send completed
+#define W6100_SIR_RECV      (1 << 2)  // Data received in RX buffer
 
 /*******************************************************************************
  * Memory Configuration

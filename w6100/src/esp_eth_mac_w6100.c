@@ -22,6 +22,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_eth_mac_w6100.h"
+#include "esp_idf_version.h"
 #include "w6100.h"
 
 static const char *TAG = "w6100.mac";
@@ -64,6 +65,10 @@ typedef struct {
     bool packets_remain;
     uint8_t *rx_buffer;
     uint32_t tx_tmo;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+    uint8_t mcast_v4_cnt;
+    uint8_t mcast_v6_cnt;
+#endif
 } emac_w6100_t;
 
 static void *w6100_spi_init(const void *spi_config)
@@ -343,6 +348,11 @@ static esp_err_t w6100_setup_default(emac_w6100_t *emac)
     
     /* Enable MAC RAW mode for SOCK0, enable MAC filter */
     reg_value = W6100_SMR_MACRAW | W6100_SMR_MF;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+    /* Block IPv4 and IPv6 multicast by default until add_mac_filter is called.
+     * Per datasheet: MMB=1/MMB6=1 blocks multicast, MMB=0/MMB6=0 allows it. */
+    reg_value |= W6100_SMR_MMB | W6100_SMR_MMB6;
+#endif
     ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SOCK_MR(0), &reg_value, sizeof(reg_value)), err, TAG, "write SMR failed");
     
     /* Enable receive event for SOCK0 */
@@ -368,6 +378,7 @@ static esp_err_t emac_w6100_start(esp_eth_mac_t *mac)
     uint8_t reg_value = 0;
     /* open SOCK0 */
     ESP_GOTO_ON_ERROR(w6100_send_command(emac, W6100_SCR_OPEN, 100), err, TAG, "issue OPEN command failed");
+
     /* enable interrupt for SOCK0 */
     reg_value = W6100_SIMR_SOCK0;
     ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SIMR, &reg_value, sizeof(reg_value)), err, TAG, "write SIMR failed");
@@ -538,6 +549,111 @@ static esp_err_t emac_w6100_set_promiscuous(esp_eth_mac_t *mac, bool enable)
 err:
     return ret;
 }
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+/**
+ * @brief Set multicast blocking state for IPv4 and IPv6
+ * 
+ * Per datasheet: MMB=1/MMB6=1 blocks multicast, MMB=0/MMB6=0 allows it.
+ */
+static esp_err_t emac_w6100_set_mcast_block(emac_w6100_t *emac, bool block_v4, bool block_v6)
+{
+    esp_err_t ret = ESP_OK;
+    uint8_t smr;
+    ESP_GOTO_ON_ERROR(w6100_read(emac, W6100_REG_SOCK_MR(0), &smr, sizeof(smr)), err, TAG, "read SMR failed");
+    ESP_LOGD(TAG, "set_mcast_block: block_v4=%d, block_v6=%d, SMR before=0x%02x", block_v4, block_v6, smr);
+    /* Datasheet logic: set bit to block, clear bit to allow */
+    if (block_v4) {
+        smr |= W6100_SMR_MMB;    // Set to block
+    } else {
+        smr &= ~W6100_SMR_MMB;   // Clear to allow
+    }
+    if (block_v6) {
+        smr |= W6100_SMR_MMB6;   // Set to block
+    } else {
+        smr &= ~W6100_SMR_MMB6;  // Clear to allow
+    }
+    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SOCK_MR(0), &smr, sizeof(smr)), err, TAG, "write SMR failed");
+    ESP_LOGD(TAG, "set_mcast_block: SMR after=0x%02x (MMB=%d, MMB6=%d)", smr, (smr & W6100_SMR_MMB) ? 1 : 0, (smr & W6100_SMR_MMB6) ? 1 : 0);
+err:
+    return ret;
+}
+
+static esp_err_t emac_w6100_add_mac_filter(esp_eth_mac_t *mac, uint8_t *addr)
+{
+    esp_err_t ret = ESP_OK;
+    emac_w6100_t *emac = __containerof(mac, emac_w6100_t, parent);
+    ESP_LOGD(TAG, "add_mac_filter: %02x:%02x:%02x:%02x:%02x:%02x (v4_cnt=%d, v6_cnt=%d)",
+             addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
+             emac->mcast_v4_cnt, emac->mcast_v6_cnt);
+    // W6100 doesn't have specific MAC filter, so we just un-block multicast.
+    if (addr[0] == 0x01 && addr[1] == 0x00 && addr[2] == 0x5e) {
+        // IPv4 multicast
+        if (emac->mcast_v4_cnt == 0) {
+            ESP_GOTO_ON_ERROR(emac_w6100_set_mcast_block(emac, false, emac->mcast_v6_cnt == 0),
+                              err, TAG, "set multicast block failed");
+        }
+        emac->mcast_v4_cnt++;
+    } else if (addr[0] == 0x33 && addr[1] == 0x33) {
+        // IPv6 multicast
+        if (emac->mcast_v6_cnt == 0) {
+            ESP_GOTO_ON_ERROR(emac_w6100_set_mcast_block(emac, emac->mcast_v4_cnt == 0, false),
+                              err, TAG, "set multicast block failed");
+        }
+        emac->mcast_v6_cnt++;
+    } else {
+        ESP_LOGE(TAG, "W6100 filters in IP multicast frames only!");
+        ret = ESP_ERR_NOT_SUPPORTED;
+    }
+err:
+    return ret;
+}
+
+static esp_err_t emac_w6100_rm_mac_filter(esp_eth_mac_t *mac, uint8_t *addr)
+{
+    esp_err_t ret = ESP_OK;
+    emac_w6100_t *emac = __containerof(mac, emac_w6100_t, parent);
+    ESP_LOGI(TAG, "rm_mac_filter: %02x:%02x:%02x:%02x:%02x:%02x (v4_cnt=%d, v6_cnt=%d)",
+             addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
+             emac->mcast_v4_cnt, emac->mcast_v6_cnt);
+    if (addr[0] == 0x01 && addr[1] == 0x00 && addr[2] == 0x5e) {
+        // IPv4 multicast
+        if (emac->mcast_v4_cnt > 0) {
+            emac->mcast_v4_cnt--;
+            if (emac->mcast_v4_cnt == 0) {
+                ESP_GOTO_ON_ERROR(emac_w6100_set_mcast_block(emac, true, emac->mcast_v6_cnt == 0),
+                                  err, TAG, "set multicast block failed");
+            }
+        }
+    } else if (addr[0] == 0x33 && addr[1] == 0x33) {
+        // IPv6 multicast
+        if (emac->mcast_v6_cnt > 0) {
+            emac->mcast_v6_cnt--;
+            if (emac->mcast_v6_cnt == 0) {
+                ESP_GOTO_ON_ERROR(emac_w6100_set_mcast_block(emac, emac->mcast_v4_cnt == 0, true),
+                                  err, TAG, "set multicast block failed");
+            }
+        }
+    } else {
+        ESP_LOGE(TAG, "W6100 filters in IP multicast frames only!");
+        ret = ESP_ERR_NOT_SUPPORTED;
+    }
+err:
+    return ret;
+}
+
+static esp_err_t emac_w6100_set_all_multicast(esp_eth_mac_t *mac, bool enable)
+{
+    emac_w6100_t *emac = __containerof(mac, emac_w6100_t, parent);
+    ESP_RETURN_ON_ERROR(emac_w6100_set_mcast_block(emac, !enable, !enable), TAG, "set multicast block failed");
+    emac->mcast_v4_cnt = 0;
+    emac->mcast_v6_cnt = 0;
+    if (enable) {
+        ESP_LOGW(TAG, "W6100 filters in IP multicast frames only!");
+    }
+    return ESP_OK;
+}
+#endif // ESP_IDF_VERSION >= 6.0.0
 
 static esp_err_t emac_w6100_enable_flow_ctrl(esp_eth_mac_t *mac, bool enable)
 {
@@ -893,6 +1009,11 @@ esp_eth_mac_t *esp_eth_mac_new_w6100(const eth_w6100_config_t *w6100_config, con
     emac->parent.set_duplex = emac_w6100_set_duplex;
     emac->parent.set_link = emac_w6100_set_link;
     emac->parent.set_promiscuous = emac_w6100_set_promiscuous;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+    emac->parent.add_mac_filter = emac_w6100_add_mac_filter;
+    emac->parent.rm_mac_filter = emac_w6100_rm_mac_filter;
+    emac->parent.set_all_multicast = emac_w6100_set_all_multicast;
+#endif
     emac->parent.set_peer_pause_ability = emac_w6100_set_peer_pause_ability;
     emac->parent.enable_flow_ctrl = emac_w6100_enable_flow_ctrl;
     emac->parent.transmit = emac_w6100_transmit;
