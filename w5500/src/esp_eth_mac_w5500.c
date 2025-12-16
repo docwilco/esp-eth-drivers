@@ -25,12 +25,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "wiznet_spi.h"
 #include "w5500.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "w5500.mac";
 
-#define W5500_SPI_LOCK_TIMEOUT_MS (50)
 #define W5500_TX_MEM_SIZE (0x4000)
 #define W5500_RX_MEM_SIZE (0x4000)
 #define W5500_100M_TX_TMO_US (200)
@@ -43,19 +43,6 @@ typedef struct {
     uint32_t rx_len;
     uint32_t remain;
 } __attribute__((packed)) emac_w5500_auto_buf_info_t;
-
-typedef struct {
-    spi_device_handle_t hdl;
-    SemaphoreHandle_t lock;
-} eth_spi_info_t;
-
-typedef struct {
-    void *ctx;
-    void *(*init)(const void *spi_config);
-    esp_err_t (*deinit)(void *spi_ctx);
-    esp_err_t (*read)(void *spi_ctx, uint32_t cmd, uint32_t addr, void *data, uint32_t data_len);
-    esp_err_t (*write)(void *spi_ctx, uint32_t cmd, uint32_t addr, const void *data, uint32_t data_len);
-} eth_spi_custom_driver_t;
 
 typedef struct {
     esp_eth_mac_t parent;
@@ -72,114 +59,6 @@ typedef struct {
     uint8_t mcast_cnt;
     uint32_t tx_tmo;
 } emac_w5500_t;
-
-static void *w5500_spi_init(const void *spi_config)
-{
-    void *ret = NULL;
-    eth_w5500_config_t *w5500_config = (eth_w5500_config_t *)spi_config;
-    eth_spi_info_t *spi = calloc(1, sizeof(eth_spi_info_t));
-    ESP_GOTO_ON_FALSE(spi, NULL, err, TAG, "no memory for SPI context data");
-
-    /* SPI device init */
-    spi_device_interface_config_t spi_devcfg;
-    spi_devcfg = *(w5500_config->spi_devcfg);
-    if (w5500_config->spi_devcfg->command_bits == 0 && w5500_config->spi_devcfg->address_bits == 0) {
-        /* configure default SPI frame format */
-        spi_devcfg.command_bits = 16; // Actually it's the address phase in W5500 SPI frame
-        spi_devcfg.address_bits = 8;  // Actually it's the control phase in W5500 SPI frame
-    } else {
-        ESP_GOTO_ON_FALSE(w5500_config->spi_devcfg->command_bits == 16 && w5500_config->spi_devcfg->address_bits == 8,
-                          NULL, err, TAG, "incorrect SPI frame format (command_bits/address_bits)");
-    }
-    ESP_GOTO_ON_FALSE(spi_bus_add_device(w5500_config->spi_host_id, &spi_devcfg, &spi->hdl) == ESP_OK, NULL,
-                      err, TAG, "adding device to SPI host #%i failed", w5500_config->spi_host_id + 1);
-    /* create mutex */
-    spi->lock = xSemaphoreCreateMutex();
-    ESP_GOTO_ON_FALSE(spi->lock, NULL, err, TAG, "create lock failed");
-
-    ret = spi;
-    return ret;
-err:
-    if (spi) {
-        if (spi->lock) {
-            vSemaphoreDelete(spi->lock);
-        }
-        free(spi);
-    }
-    return ret;
-}
-
-static esp_err_t w5500_spi_deinit(void *spi_ctx)
-{
-    esp_err_t ret = ESP_OK;
-    eth_spi_info_t *spi = (eth_spi_info_t *)spi_ctx;
-
-    spi_bus_remove_device(spi->hdl);
-    vSemaphoreDelete(spi->lock);
-
-    free(spi);
-    return ret;
-}
-
-static inline bool w5500_spi_lock(eth_spi_info_t *spi)
-{
-    return xSemaphoreTake(spi->lock, pdMS_TO_TICKS(W5500_SPI_LOCK_TIMEOUT_MS)) == pdTRUE;
-}
-
-static inline bool w5500_spi_unlock(eth_spi_info_t *spi)
-{
-    return xSemaphoreGive(spi->lock) == pdTRUE;
-}
-
-static esp_err_t w5500_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr, const void *value, uint32_t len)
-{
-    esp_err_t ret = ESP_OK;
-    eth_spi_info_t *spi = (eth_spi_info_t *)spi_ctx;
-
-    spi_transaction_t trans = {
-        .cmd = cmd,
-        .addr = addr,
-        .length = 8 * len,
-        .tx_buffer = value
-    };
-    if (w5500_spi_lock(spi)) {
-        if (spi_device_polling_transmit(spi->hdl, &trans) != ESP_OK) {
-            ESP_LOGE(TAG, "%s(%d): spi transmit failed", __FUNCTION__, __LINE__);
-            ret = ESP_FAIL;
-        }
-        w5500_spi_unlock(spi);
-    } else {
-        ret = ESP_ERR_TIMEOUT;
-    }
-    return ret;
-}
-
-static esp_err_t w5500_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void *value, uint32_t len)
-{
-    esp_err_t ret = ESP_OK;
-    eth_spi_info_t *spi = (eth_spi_info_t *)spi_ctx;
-
-    spi_transaction_t trans = {
-        .flags = len <= 4 ? SPI_TRANS_USE_RXDATA : 0, // use direct reads for registers to prevent overwrites by 4-byte boundary writes
-        .cmd = cmd,
-        .addr = addr,
-        .length = 8 * len,
-        .rx_buffer = value
-    };
-    if (w5500_spi_lock(spi)) {
-        if (spi_device_polling_transmit(spi->hdl, &trans) != ESP_OK) {
-            ESP_LOGE(TAG, "%s(%d): spi transmit failed", __FUNCTION__, __LINE__);
-            ret = ESP_FAIL;
-        }
-        w5500_spi_unlock(spi);
-    } else {
-        ret = ESP_ERR_TIMEOUT;
-    }
-    if ((trans.flags & SPI_TRANS_USE_RXDATA) && len <= 4) {
-        memcpy(value, trans.rx_data, len);  // copy register values to output
-    }
-    return ret;
-}
 
 static esp_err_t w5500_read(emac_w5500_t *emac, uint32_t address, void *data, uint32_t len)
 {
@@ -968,10 +847,10 @@ esp_eth_mac_t *esp_eth_mac_new_w5500(const eth_w5500_config_t *w5500_config, con
         ESP_GOTO_ON_FALSE((emac->spi.ctx = emac->spi.init(w5500_config->custom_spi_driver.config)) != NULL, NULL, err, TAG, "SPI initialization failed");
     } else {
         ESP_LOGD(TAG, "Using default SPI Driver");
-        emac->spi.init = w5500_spi_init;
-        emac->spi.deinit = w5500_spi_deinit;
-        emac->spi.read = w5500_spi_read;
-        emac->spi.write = w5500_spi_write;
+        emac->spi.init = wiznet_spi_init;
+        emac->spi.deinit = wiznet_spi_deinit;
+        emac->spi.read = wiznet_spi_read;
+        emac->spi.write = wiznet_spi_write;
         /* SPI device init */
         ESP_GOTO_ON_FALSE((emac->spi.ctx = emac->spi.init(w5500_config)) != NULL, NULL, err, TAG, "SPI initialization failed");
     }

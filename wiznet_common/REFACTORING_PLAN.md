@@ -69,14 +69,31 @@ These functions share the same structure but have chip-specific register address
 | `emac_wXXXX_set_promiscuous()` | Different register bits |
 | `esp_eth_mac_new_wXXXX()` | Constructor - mostly identical structure |
 
-### W5500-Only Functions
+### Multicast Filter Functions (ESP-IDF 6.0+)
 
-| Function | Notes |
-|----------|-------|
-| `emac_w5500_set_block_ip4_mcast()` | W5500-specific multicast handling |
-| `emac_w5500_add_mac_filter()` | W5500-specific |
-| `emac_w5500_del_mac_filter()` | W5500-specific |
-| `emac_w5500_set_all_multicast()` | W5500-specific |
+Both chips now have multicast filter support, but with different capabilities:
+
+| Function | W5500 | W6100 | Notes |
+|----------|-------|-------|-------|
+| `emac_wXXXX_set_block_ip4_mcast()` | ✓ | - | W5500 helper (IPv4 only) |
+| `emac_wXXXX_set_mcast_block()` | - | ✓ | W6100 helper (IPv4 + IPv6 separate) |
+| `emac_wXXXX_add_mac_filter()` | ✓ | ✓ | Similar structure, different capabilities |
+| `emac_wXXXX_rm_mac_filter()` | ✓ | ✓ | Similar structure, different capabilities |
+| `emac_wXXXX_set_all_multicast()` | ✓ | ✓ | Similar structure |
+
+**Key Differences:**
+- **W5500**: Single `mcast_cnt` counter, IPv4 multicast controllable via `MMB` bit, IPv6 always passes (undocumented HW behavior)
+- **W6100**: Separate `mcast_v4_cnt`/`mcast_v6_cnt` counters, independent control via `MMB` (IPv4) and `MMB6` (IPv6) bits
+
+**Refactoring Approach:**
+The multicast functions share similar patterns but have chip-specific differences that make full abstraction complex. Options:
+1. Keep chip-specific implementations (simpler, clearer)
+2. Abstract with ops callbacks for block/unblock operations (more complex)
+
+Recommend option 1 - keep multicast functions chip-specific since:
+- W5500 IPv6 behavior is undocumented hardware quirk
+- Counter structures differ (1 vs 2 counters)
+- The code is relatively small and unlikely to diverge further
 
 ### PHY Layer Comparison
 
@@ -192,29 +209,43 @@ typedef struct {
     uint8_t *rx_buffer;
     uint32_t tx_tmo;
     const wiznet_chip_ops_t *ops;  // Chip-specific operations
-    void *chip_data;               // Chip-specific extra data (e.g., mcast_cnt for W5500)
+    void *chip_data;               // Chip-specific extra data (multicast counters, etc.)
 } emac_wiznet_t;
+
+// Chip-specific data structures (kept in respective drivers)
+// W5500: uint8_t mcast_cnt (IPv4 only, IPv6 always passes)
+// W6100: uint8_t mcast_v4_cnt, uint8_t mcast_v6_cnt (independent control)
 ```
 
 ## Implementation Phases
 
-### Phase 1: Create wiznet_common Component (Foundation)
+Each phase is completed for both W6100 and W5500 before moving to the next phase. This ensures abstractions are validated against both chips early.
 
-1. Create component directory structure
-2. Add `CMakeLists.txt` and `idf_component.yml`
-3. Move SPI driver code (types and functions):
-   - `eth_spi_info_t`
-   - `eth_spi_custom_driver_t`
-   - `wiznet_spi_init()` (from `wXXXX_spi_init`)
+### Phase 1: Create wiznet_common Component (SPI Layer) ✅ COMPLETE
+
+**1a. Create component structure and W6100 SPI extraction:** ✅
+1. ✅ Created component directory structure
+2. ✅ Added `CMakeLists.txt` and `idf_component.yml`
+3. ✅ Moved SPI driver code from W6100:
+   - `wiznet_spi_config_t` (matches `eth_wXXXX_config_t.spi` layout)
+   - `wiznet_spi_driver_t` (replaces `eth_spi_custom_driver_t`)
+   - `wiznet_spi_init()` (from `w6100_spi_init`)
    - `wiznet_spi_deinit()`
-   - `wiznet_spi_lock()`
-   - `wiznet_spi_unlock()`
    - `wiznet_spi_read()`
    - `wiznet_spi_write()`
-4. Create public header with shared types
+4. ✅ Created public header `wiznet_spi.h` with shared types
+5. ✅ Updated W6100 to use wiznet_common SPI functions
+6. ✅ **Tested W6100** - Build + flash + hardware test passed
+
+**1b. Update W5500 to use wiznet_common SPI:** ✅
+1. ✅ Updated W5500 `idf_component.yml` to depend on `wiznet_common`
+2. ✅ Removed duplicated SPI code from W5500
+3. ✅ Updated W5500 to use wiznet_common SPI functions
+4. ✅ **Tested W5500** - Build + flash + hardware test passed
 
 ### Phase 2: Extract Common MAC Code
 
+**2a. Create common MAC structures and move W6100:**
 1. Create `wiznet_chip_ops_t` structure
 2. Create common emac structure `emac_wiznet_t`
 3. Move identical MAC functions:
@@ -229,9 +260,19 @@ typedef struct {
    - `emac_wiznet_del()`
    - `emac_wiznet_deinit()`
 4. Move ISR and poll timer handlers
+5. Update W6100 to use shared MAC functions
+6. Keep W6100-specific multicast functions in w6100 component
+7. **Test W6100**
+
+**2b. Update W5500 to use common MAC code:**
+1. Update W5500 to use shared MAC functions
+2. Keep W5500-specific multicast functions in w5500 component
+3. **Ensure W5500 public API remains unchanged**
+4. **Test W5500**
 
 ### Phase 3: Abstract Chip-Specific MAC Operations
 
+**3a. Create ops abstraction and move W6100:**
 1. Create chip ops registration for W6100
 2. Move/refactor:
    - `wiznet_read()` / `wiznet_write()` (parameterized by ops)
@@ -242,26 +283,14 @@ typedef struct {
    - `emac_wiznet_flush_recv_frame()`
    - `emac_wiznet_task()` (uses ops for registers)
    - `emac_wiznet_init()` (calls ops for chip-specific init)
+3. **Test W6100**
 
-### Phase 4: Update W6100 to Use wiznet_common
+**3b. Update W5500 to use ops abstraction:**
+1. Implement W5500-specific ops structure
+2. Update W5500 to use shared MAC operations
+3. **Test W5500**
 
-1. Update W6100 `CMakeLists.txt` to depend on `wiznet_common`
-2. Remove duplicated code from W6100
-3. Implement W6100-specific ops structure
-4. Update `esp_eth_mac_new_w6100()` to use shared code
-5. **Test W6100 thoroughly**
-
-### Phase 5: Update W5500 to Use wiznet_common
-
-1. Update W5500 `CMakeLists.txt` to depend on `wiznet_common`
-2. Remove duplicated code from W5500
-3. Implement W5500-specific ops structure
-4. Keep W5500-specific multicast functions in w5500 component
-5. Update `esp_eth_mac_new_w5500()` to use shared code
-6. **Ensure W5500 public API remains unchanged**
-7. **Test W5500 thoroughly**
-
-### Phase 6: PHY Refactoring (Optional/Later)
+### Phase 4: PHY Refactoring (Optional/Later)
 
 The PHY layer has less code and more chip-specific differences (bit polarities, register layouts). Consider:
 - Extract only truly common functions (set_mediator, get/set_addr, del)
@@ -269,12 +298,10 @@ The PHY layer has less code and more chip-specific differences (bit polarities, 
 
 ## Testing Strategy
 
-After each phase, verify:
+After each sub-phase (a/b), verify:
 
-1. **Build test**: Both components compile without errors
+1. **Build test**: Component compiles without errors
 2. **Functional test**: Use eth-test application
-   - Test with W6100 (after Phase 4)
-   - Test with W5500 (after Phase 5)
    - Test both polling and interrupt modes
    - Test link up/down detection
    - Test TX/RX functionality
