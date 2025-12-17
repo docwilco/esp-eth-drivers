@@ -20,13 +20,48 @@ extern "C" {
 typedef struct emac_wiznet_s emac_wiznet_t;
 
 /**
+ * @brief SPI frame encoding constants (identical for W5500 and W6100)
+ *
+ * Both chips use the same SPI frame format:
+ * - 16-bit address phase (offset within block)
+ * - 8-bit control phase (BSB[4:0] + RWB + OM[1:0])
+ */
+#define WIZNET_ADDR_OFFSET       16    /*!< Address bits are in upper 16 bits of 32-bit value */
+#define WIZNET_RWB_OFFSET        2     /*!< Read/Write bit offset in control phase */
+#define WIZNET_ACCESS_MODE_READ  0     /*!< Read access (RWB=0) */
+#define WIZNET_ACCESS_MODE_WRITE 1     /*!< Write access (RWB=1) */
+#define WIZNET_SPI_OP_MODE_VDM   0x00  /*!< Variable Data Length Mode */
+
+/**
+ * @brief Logical register identifiers for translation table
+ *
+ * These provide a chip-agnostic way to reference registers. Each chip's ops
+ * structure contains a translation table mapping these IDs to actual addresses.
+ *
+ * Note: Not all registers exist on all chips. Check for 0 (invalid) before use.
+ */
+typedef enum {
+    /* Common registers */
+    WIZNET_REG_MAC_ADDR,        /*!< MAC address register (W5500: SHAR, W6100: SHAR) */
+    WIZNET_REG_SOCK_MR,         /*!< Socket mode register (W5500: Sn_MR, W6100: Sn_MR) */
+    WIZNET_REG_SOCK_IMR,        /*!< Socket interrupt mask register (W5500: Sn_IMR, W6100: Sn_IMR) */
+    WIZNET_REG_SOCK_RXBUF_SIZE, /*!< Socket RX buffer size (W5500: Sn_RXBUF_SIZE, W6100: Sn_RX_BSR) */
+    WIZNET_REG_SOCK_TXBUF_SIZE, /*!< Socket TX buffer size (W5500: Sn_TXBUF_SIZE, W6100: Sn_TX_BSR) */
+    WIZNET_REG_INT_LEVEL,       /*!< Interrupt level timer (W5500: INTLEVEL, W6100: INTPTMR) */
+    WIZNET_REG_COUNT            /*!< Number of register IDs (must be last) */
+} wiznet_reg_id_t;
+
+/**
  * @brief Chip-specific operations structure for WIZnet Ethernet controllers
  *
  * This structure abstracts the register address and protocol differences
  * between W5500, W6100, and other WIZnet chips, allowing shared TX/RX logic.
  */
 typedef struct {
-    /* Register addresses (pre-computed for socket 0) */
+    /* Register translation table for common registers */
+    uint32_t regs[WIZNET_REG_COUNT];  /*!< Maps wiznet_reg_id_t to chip-specific addresses */
+
+    /* Register addresses (pre-computed for socket 0) - used by TX/RX code */
     uint32_t reg_sock_cr;           /*!< Socket command register */
     uint32_t reg_sock_ir;           /*!< Socket interrupt register */
     uint32_t reg_sock_tx_fsr;       /*!< Socket TX free size register */
@@ -45,11 +80,16 @@ typedef struct {
     /* Command values */
     uint8_t cmd_send;               /*!< Send command value */
     uint8_t cmd_recv;               /*!< Receive command value */
+    uint8_t cmd_open;               /*!< Open socket command value */
+    uint8_t cmd_close;              /*!< Close socket command value */
 
     /* Interrupt bits */
     uint8_t sir_send;               /*!< Send complete interrupt bit */
     uint8_t sir_recv;               /*!< Receive interrupt bit */
     uint8_t simr_sock0;             /*!< Socket 0 interrupt mask bit */
+
+    /* Bit masks for socket mode register */
+    uint8_t smr_mac_filter;         /*!< MAC filter enable bit */
 
     /* Chip-specific callbacks */
     bool (*is_sane_for_rxtx)(emac_wiznet_t *emac);  /*!< Check if PHY is ready for TX/RX */
@@ -180,6 +220,56 @@ void wiznet_isr_handler(void *arg);
  * @param arg Pointer to emac_wiznet_t instance
  */
 void wiznet_poll_timer(void *arg);
+
+/*******************************************************************************
+ * Register Access Functions
+ *
+ * These functions provide unified register access for all WIZnet chips.
+ * The SPI frame encoding is identical for W5500 and W6100.
+ ******************************************************************************/
+
+/**
+ * @brief Read data from WIZnet chip register or memory
+ *
+ * Performs SPI read with the standard WIZnet frame format:
+ * - 16-bit address phase
+ * - 8-bit control phase (BSB + RWB=0 + OM)
+ *
+ * @param emac WIZnet EMAC instance
+ * @param address Pre-encoded register address (includes BSB in bits 15:11)
+ * @param data Buffer to store read data
+ * @param len Number of bytes to read
+ * @return ESP_OK on success, or SPI error code
+ */
+esp_err_t wiznet_read(emac_wiznet_t *emac, uint32_t address, void *data, uint32_t len);
+
+/**
+ * @brief Write data to WIZnet chip register or memory
+ *
+ * Performs SPI write with the standard WIZnet frame format:
+ * - 16-bit address phase
+ * - 8-bit control phase (BSB + RWB=1 + OM)
+ *
+ * @param emac WIZnet EMAC instance
+ * @param address Pre-encoded register address (includes BSB in bits 15:11)
+ * @param data Data to write
+ * @param len Number of bytes to write
+ * @return ESP_OK on success, or SPI error code
+ */
+esp_err_t wiznet_write(emac_wiznet_t *emac, uint32_t address, const void *data, uint32_t len);
+
+/**
+ * @brief Send a socket command and wait for completion
+ *
+ * Writes the command to the socket command register and polls until
+ * the command is acknowledged (register reads 0).
+ *
+ * @param emac WIZnet EMAC instance
+ * @param command Command value to send
+ * @param timeout_ms Timeout in milliseconds
+ * @return ESP_OK on success, ESP_ERR_TIMEOUT if command not acknowledged
+ */
+esp_err_t wiznet_send_command(emac_wiznet_t *emac, uint8_t command, uint32_t timeout_ms);
 
 /**
  * @brief Common transmit function using chip ops

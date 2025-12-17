@@ -47,6 +47,16 @@ typedef struct {
 static bool is_w6100_sane_for_rxtx(emac_wiznet_t *emac);
 
 static const wiznet_chip_ops_t w6100_ops = {
+    /* Register translation table for common registers */
+    .regs = {
+        [WIZNET_REG_MAC_ADDR]        = W6100_REG_SHAR,
+        [WIZNET_REG_SOCK_MR]         = W6100_REG_SOCK_MR(0),
+        [WIZNET_REG_SOCK_IMR]        = W6100_REG_SOCK_IMR(0),
+        [WIZNET_REG_SOCK_RXBUF_SIZE] = W6100_REG_SOCK_RX_BSR(0),
+        [WIZNET_REG_SOCK_TXBUF_SIZE] = W6100_REG_SOCK_TX_BSR(0),
+        [WIZNET_REG_INT_LEVEL]       = W6100_REG_INTPTMR,
+    },
+
     /* Socket 0 registers (pre-computed addresses) */
     .reg_sock_cr = W6100_REG_SOCK_CR(0),
     .reg_sock_ir = W6100_REG_SOCK_IR(0),
@@ -66,11 +76,16 @@ static const wiznet_chip_ops_t w6100_ops = {
     /* Command values */
     .cmd_send = W6100_SCR_SEND,
     .cmd_recv = W6100_SCR_RECV,
+    .cmd_open = W6100_SCR_OPEN,
+    .cmd_close = W6100_SCR_CLOSE,
 
     /* Interrupt bits */
     .sir_send = W6100_SIR_SENDOK,
     .sir_recv = W6100_SIR_RECV,
     .simr_sock0 = W6100_SIMR_SOCK0,
+
+    /* Bit masks */
+    .smr_mac_filter = W6100_SMR_MF,
 
     /* Callbacks */
     .is_sane_for_rxtx = is_w6100_sane_for_rxtx,
@@ -80,54 +95,22 @@ static bool is_w6100_sane_for_rxtx(emac_wiznet_t *emac)
 {
     uint8_t physr;
     /* PHY is ok for rx and tx operations if LNK bit is set */
-    if (emac->spi.read(emac->spi.ctx, (W6100_REG_PHYSR >> 16), (W6100_REG_PHYSR & 0xFFFF), &physr, 1) == ESP_OK 
+    if (wiznet_read(emac, W6100_REG_PHYSR, &physr, 1) == ESP_OK 
         && (physr & W6100_PHYSR_LNK)) {
         return true;
     }
     return false;
 }
 
-static esp_err_t w6100_read(emac_w6100_t *emac, uint32_t address, void *data, uint32_t len)
-{
-    uint32_t cmd = (address >> W6100_ADDR_OFFSET); // Address phase in W6100 SPI frame
-    uint32_t addr = ((address & 0xFFFF) | (W6100_ACCESS_MODE_READ << W6100_RWB_OFFSET)
-                    | W6100_SPI_OP_MODE_VDM); // Control phase in W6100 SPI frame
-
-    return emac->base.spi.read(emac->base.spi.ctx, cmd, addr, data, len);
-}
-
-static esp_err_t w6100_write(emac_w6100_t *emac, uint32_t address, const void *data, uint32_t len)
-{
-    uint32_t cmd = (address >> W6100_ADDR_OFFSET); // Address phase in W6100 SPI frame
-    uint32_t addr = ((address & 0xFFFF) | (W6100_ACCESS_MODE_WRITE << W6100_RWB_OFFSET)
-                    | W6100_SPI_OP_MODE_VDM); // Control phase in W6100 SPI frame
-
-    return emac->base.spi.write(emac->base.spi.ctx, cmd, addr, data, len);
-}
-
-static esp_err_t w6100_send_command(emac_w6100_t *emac, uint8_t command, uint32_t timeout_ms)
-{
-    esp_err_t ret = ESP_OK;
-    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SOCK_CR(0), &command, sizeof(command)), err, TAG, "write SCR failed");
-    // after W6100 accepts the command, the command register will be cleared automatically
-    uint32_t to = 0;
-    for (to = 0; to < timeout_ms / 10; to++) {
-        ESP_GOTO_ON_ERROR(w6100_read(emac, W6100_REG_SOCK_CR(0), &command, sizeof(command)), err, TAG, "read SCR failed");
-        if (!command) {
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    ESP_GOTO_ON_FALSE(to < timeout_ms / 10, ESP_ERR_TIMEOUT, err, TAG, "send command timeout");
-
-err:
-    return ret;
-}
+/* Helper macros to cast emac_w6100_t* to emac_wiznet_t* for wiznet_* functions */
+#define W6100_READ(emac, addr, data, len)   wiznet_read(&(emac)->base, (addr), (data), (len))
+#define W6100_WRITE(emac, addr, data, len)  wiznet_write(&(emac)->base, (addr), (data), (len))
+#define W6100_SEND_CMD(emac, cmd, tmo)      wiznet_send_command(&(emac)->base, (cmd), (tmo))
 
 static esp_err_t w6100_set_mac_addr(emac_w6100_t *emac)
 {
     esp_err_t ret = ESP_OK;
-    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SHAR, emac->base.addr, 6), err, TAG, "write MAC address register failed");
+    ESP_GOTO_ON_ERROR(W6100_WRITE(emac, W6100_REG_SHAR, emac->base.addr, 6), err, TAG, "write MAC address register failed");
 
 err:
     return ret;
@@ -138,7 +121,7 @@ static esp_err_t w6100_reset(emac_w6100_t *emac)
     esp_err_t ret = ESP_OK;
     /* software reset - write 0 to RST bit to trigger reset */
     uint8_t sycr0 = 0x00; // Clear RST bit (bit 7) to reset
-    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SYCR0, &sycr0, sizeof(sycr0)), err, TAG, "write SYCR0 failed");
+    ESP_GOTO_ON_ERROR(W6100_WRITE(emac, W6100_REG_SYCR0, &sycr0, sizeof(sycr0)), err, TAG, "write SYCR0 failed");
     
     /* Wait for reset to complete - need to wait for chip to stabilize */
     vTaskDelay(pdMS_TO_TICKS(100));  // W6100 needs ~60.3ms after reset
@@ -158,7 +141,7 @@ static esp_err_t w6100_verify_id(emac_w6100_t *emac)
     ESP_LOGD(TAG, "Waiting W6100 to start & verify chip ID...");
     uint32_t to = 0;
     for (to = 0; to < emac->base.sw_reset_timeout_ms / 10; to++) {
-        ESP_GOTO_ON_ERROR(w6100_read(emac, W6100_REG_CIDR, &chip_id, sizeof(chip_id)), err, TAG, "read CIDR failed");
+        ESP_GOTO_ON_ERROR(W6100_READ(emac, W6100_REG_CIDR, &chip_id, sizeof(chip_id)), err, TAG, "read CIDR failed");
         chip_id = __builtin_bswap16(chip_id);
         if (chip_id == W6100_CHIP_ID) {
             break;
@@ -172,7 +155,7 @@ static esp_err_t w6100_verify_id(emac_w6100_t *emac)
     }
     
     // Also verify version
-    ESP_GOTO_ON_ERROR(w6100_read(emac, W6100_REG_VER, &version, sizeof(version)), err, TAG, "read VER failed");
+    ESP_GOTO_ON_ERROR(W6100_READ(emac, W6100_REG_VER, &version, sizeof(version)), err, TAG, "read VER failed");
     version = __builtin_bswap16(version);
     ESP_LOGI(TAG, "W6100 chip ID: 0x%04" PRIx16 ", version: 0x%04" PRIx16, chip_id, version);
     
@@ -188,24 +171,24 @@ static esp_err_t w6100_setup_default(emac_w6100_t *emac)
 
     // Unlock network configuration
     uint8_t unlock = W6100_NETLCKR_UNLOCK;
-    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_NETLCKR, &unlock, sizeof(unlock)), err, TAG, "unlock network config failed");
+    ESP_GOTO_ON_ERROR(W6100_WRITE(emac, W6100_REG_NETLCKR, &unlock, sizeof(unlock)), err, TAG, "unlock network config failed");
 
     // Only SOCK0 can be used as MAC RAW mode, so we give the whole buffer (16KB TX and 16KB RX) to SOCK0
-    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SOCK_RX_BSR(0), &reg_value, sizeof(reg_value)), err, TAG, "set rx buffer size failed");
-    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SOCK_TX_BSR(0), &reg_value, sizeof(reg_value)), err, TAG, "set tx buffer size failed");
+    ESP_GOTO_ON_ERROR(W6100_WRITE(emac, W6100_REG_SOCK_RX_BSR(0), &reg_value, sizeof(reg_value)), err, TAG, "set rx buffer size failed");
+    ESP_GOTO_ON_ERROR(W6100_WRITE(emac, W6100_REG_SOCK_TX_BSR(0), &reg_value, sizeof(reg_value)), err, TAG, "set tx buffer size failed");
     reg_value = 0;
     for (int i = 1; i < 8; i++) {
-        ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SOCK_RX_BSR(i), &reg_value, sizeof(reg_value)), err, TAG, "set rx buffer size failed");
-        ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SOCK_TX_BSR(i), &reg_value, sizeof(reg_value)), err, TAG, "set tx buffer size failed");
+        ESP_GOTO_ON_ERROR(W6100_WRITE(emac, W6100_REG_SOCK_RX_BSR(i), &reg_value, sizeof(reg_value)), err, TAG, "set rx buffer size failed");
+        ESP_GOTO_ON_ERROR(W6100_WRITE(emac, W6100_REG_SOCK_TX_BSR(i), &reg_value, sizeof(reg_value)), err, TAG, "set tx buffer size failed");
     }
 
     /* Configure network mode - block ping responses for security */
     reg_value = 0;
-    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_NETMR, &reg_value, sizeof(reg_value)), err, TAG, "write NETMR failed");
+    ESP_GOTO_ON_ERROR(W6100_WRITE(emac, W6100_REG_NETMR, &reg_value, sizeof(reg_value)), err, TAG, "write NETMR failed");
     
     /* Disable interrupt for all sockets by default */
     reg_value = 0;
-    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SIMR, &reg_value, sizeof(reg_value)), err, TAG, "write SIMR failed");
+    ESP_GOTO_ON_ERROR(W6100_WRITE(emac, W6100_REG_SIMR, &reg_value, sizeof(reg_value)), err, TAG, "write SIMR failed");
     
     /* Enable MAC RAW mode for SOCK0, enable MAC filter */
     reg_value = W6100_SMR_MACRAW | W6100_SMR_MF;
@@ -214,19 +197,19 @@ static esp_err_t w6100_setup_default(emac_w6100_t *emac)
      * Per datasheet: MMB=1/MMB6=1 blocks multicast, MMB=0/MMB6=0 allows it. */
     reg_value |= W6100_SMR_MMB | W6100_SMR_MMB6;
 #endif
-    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SOCK_MR(0), &reg_value, sizeof(reg_value)), err, TAG, "write SMR failed");
+    ESP_GOTO_ON_ERROR(W6100_WRITE(emac, W6100_REG_SOCK_MR(0), &reg_value, sizeof(reg_value)), err, TAG, "write SMR failed");
     
     /* Enable receive event for SOCK0 */
     reg_value = W6100_SIR_RECV;
-    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SOCK_IMR(0), &reg_value, sizeof(reg_value)), err, TAG, "write SOCK0 IMR failed");
+    ESP_GOTO_ON_ERROR(W6100_WRITE(emac, W6100_REG_SOCK_IMR(0), &reg_value, sizeof(reg_value)), err, TAG, "write SOCK0 IMR failed");
     
     /* Set the interrupt re-assert level to maximum (~1.5ms) to lower the chances of missing it */
     uint16_t int_level = __builtin_bswap16(0xFFFF);
-    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_INTPTMR, &int_level, sizeof(int_level)), err, TAG, "write INTPTMR failed");
+    ESP_GOTO_ON_ERROR(W6100_WRITE(emac, W6100_REG_INTPTMR, &int_level, sizeof(int_level)), err, TAG, "write INTPTMR failed");
 
     /* Enable global interrupt */
     reg_value = W6100_SYCR1_IEN;
-    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SYCR1, &reg_value, sizeof(reg_value)), err, TAG, "write SYCR1 failed");
+    ESP_GOTO_ON_ERROR(W6100_WRITE(emac, W6100_REG_SYCR1, &reg_value, sizeof(reg_value)), err, TAG, "write SYCR1 failed");
 
 err:
     return ret;
@@ -238,11 +221,11 @@ static esp_err_t emac_w6100_start(esp_eth_mac_t *mac)
     emac_w6100_t *emac = __containerof(mac, emac_w6100_t, base.parent);
     uint8_t reg_value = 0;
     /* open SOCK0 */
-    ESP_GOTO_ON_ERROR(w6100_send_command(emac, W6100_SCR_OPEN, 100), err, TAG, "issue OPEN command failed");
+    ESP_GOTO_ON_ERROR(W6100_SEND_CMD(emac, W6100_SCR_OPEN, 100), err, TAG, "issue OPEN command failed");
 
     /* enable interrupt for SOCK0 */
     reg_value = W6100_SIMR_SOCK0;
-    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SIMR, &reg_value, sizeof(reg_value)), err, TAG, "write SIMR failed");
+    ESP_GOTO_ON_ERROR(W6100_WRITE(emac, W6100_REG_SIMR, &reg_value, sizeof(reg_value)), err, TAG, "write SIMR failed");
 
 err:
     return ret;
@@ -254,9 +237,9 @@ static esp_err_t emac_w6100_stop(esp_eth_mac_t *mac)
     emac_w6100_t *emac = __containerof(mac, emac_w6100_t, base.parent);
     uint8_t reg_value = 0;
     /* disable interrupt */
-    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SIMR, &reg_value, sizeof(reg_value)), err, TAG, "write SIMR failed");
+    ESP_GOTO_ON_ERROR(W6100_WRITE(emac, W6100_REG_SIMR, &reg_value, sizeof(reg_value)), err, TAG, "write SIMR failed");
     /* close SOCK0 */
-    ESP_GOTO_ON_ERROR(w6100_send_command(emac, W6100_SCR_CLOSE, 100), err, TAG, "issue CLOSE command failed");
+    ESP_GOTO_ON_ERROR(W6100_SEND_CMD(emac, W6100_SCR_CLOSE, 100), err, TAG, "issue CLOSE command failed");
 
 err:
     return ret;
@@ -269,7 +252,7 @@ static esp_err_t emac_w6100_write_phy_reg(esp_eth_mac_t *mac, uint32_t phy_addr,
     // PHY registers are mapped directly in W6100's register space
     // The phy_reg parameter contains the full W6100 register address
     uint8_t val = (uint8_t)reg_value;
-    ESP_GOTO_ON_ERROR(w6100_write(emac, phy_reg, &val, sizeof(val)), err, TAG, "write PHY register failed");
+    ESP_GOTO_ON_ERROR(W6100_WRITE(emac, phy_reg, &val, sizeof(val)), err, TAG, "write PHY register failed");
 
 err:
     return ret;
@@ -283,7 +266,7 @@ static esp_err_t emac_w6100_read_phy_reg(esp_eth_mac_t *mac, uint32_t phy_addr, 
     // PHY registers are mapped directly in W6100's register space
     // The phy_reg parameter contains the full W6100 register address
     uint8_t val = 0;
-    ESP_GOTO_ON_ERROR(w6100_read(emac, phy_reg, &val, sizeof(val)), err, TAG, "read PHY register failed");
+    ESP_GOTO_ON_ERROR(W6100_READ(emac, phy_reg, &val, sizeof(val)), err, TAG, "read PHY register failed");
     *reg_value = val;
 
 err:
@@ -328,13 +311,13 @@ static esp_err_t emac_w6100_set_promiscuous(esp_eth_mac_t *mac, bool enable)
     esp_err_t ret = ESP_OK;
     emac_w6100_t *emac = __containerof(mac, emac_w6100_t, base.parent);
     uint8_t smr = 0;
-    ESP_GOTO_ON_ERROR(w6100_read(emac, W6100_REG_SOCK_MR(0), &smr, sizeof(smr)), err, TAG, "read SMR failed");
+    ESP_GOTO_ON_ERROR(W6100_READ(emac, W6100_REG_SOCK_MR(0), &smr, sizeof(smr)), err, TAG, "read SMR failed");
     if (enable) {
         smr &= ~W6100_SMR_MF;
     } else {
         smr |= W6100_SMR_MF;
     }
-    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SOCK_MR(0), &smr, sizeof(smr)), err, TAG, "write SMR failed");
+    ESP_GOTO_ON_ERROR(W6100_WRITE(emac, W6100_REG_SOCK_MR(0), &smr, sizeof(smr)), err, TAG, "write SMR failed");
 
 err:
     return ret;
@@ -350,7 +333,7 @@ static esp_err_t emac_w6100_set_mcast_block(emac_w6100_t *emac, bool block_v4, b
 {
     esp_err_t ret = ESP_OK;
     uint8_t smr;
-    ESP_GOTO_ON_ERROR(w6100_read(emac, W6100_REG_SOCK_MR(0), &smr, sizeof(smr)), err, TAG, "read SMR failed");
+    ESP_GOTO_ON_ERROR(W6100_READ(emac, W6100_REG_SOCK_MR(0), &smr, sizeof(smr)), err, TAG, "read SMR failed");
     ESP_LOGD(TAG, "set_mcast_block: block_v4=%d, block_v6=%d, SMR before=0x%02x", block_v4, block_v6, smr);
     /* Datasheet logic: set bit to block, clear bit to allow */
     if (block_v4) {
@@ -363,7 +346,7 @@ static esp_err_t emac_w6100_set_mcast_block(emac_w6100_t *emac, bool block_v4, b
     } else {
         smr &= ~W6100_SMR_MMB6;  // Clear to allow
     }
-    ESP_GOTO_ON_ERROR(w6100_write(emac, W6100_REG_SOCK_MR(0), &smr, sizeof(smr)), err, TAG, "write SMR failed");
+    ESP_GOTO_ON_ERROR(W6100_WRITE(emac, W6100_REG_SOCK_MR(0), &smr, sizeof(smr)), err, TAG, "write SMR failed");
     ESP_LOGD(TAG, "set_mcast_block: SMR after=0x%02x (MMB=%d, MMB6=%d)", smr, (smr & W6100_SMR_MMB) ? 1 : 0, (smr & W6100_SMR_MMB6) ? 1 : 0);
 err:
     return ret;

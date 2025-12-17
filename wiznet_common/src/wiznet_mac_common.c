@@ -148,26 +148,26 @@ void wiznet_poll_timer(void *arg)
  * SPI Read/Write Helpers (using ops for register addresses)
  ******************************************************************************/
 
-static esp_err_t wiznet_read(emac_wiznet_t *emac, uint32_t address, void *data, uint32_t len)
+esp_err_t wiznet_read(emac_wiznet_t *emac, uint32_t address, void *data, uint32_t len)
 {
     /* Address encoding is identical for W5500/W6100:
      * - Upper bits: address phase (16-bit offset)
      * - Lower bits: control phase (BSB + RWB + OM)
      * The ops structure stores pre-encoded register addresses.
      */
-    uint32_t cmd = (address >> 16);
+    uint32_t cmd = (address >> WIZNET_ADDR_OFFSET);
     uint32_t addr = (address & 0xFFFF);  // Already includes BSB, just add read bit
     return emac->spi.read(emac->spi.ctx, cmd, addr, data, len);
 }
 
-static esp_err_t wiznet_write(emac_wiznet_t *emac, uint32_t address, const void *data, uint32_t len)
+esp_err_t wiznet_write(emac_wiznet_t *emac, uint32_t address, const void *data, uint32_t len)
 {
-    uint32_t cmd = (address >> 16);
-    uint32_t addr = (address & 0xFFFF) | (1 << 2);  // Set RWB bit for write
+    uint32_t cmd = (address >> WIZNET_ADDR_OFFSET);
+    uint32_t addr = (address & 0xFFFF) | (WIZNET_ACCESS_MODE_WRITE << WIZNET_RWB_OFFSET);
     return emac->spi.write(emac->spi.ctx, cmd, addr, data, len);
 }
 
-static esp_err_t wiznet_send_command(emac_wiznet_t *emac, uint8_t command, uint32_t timeout_ms)
+esp_err_t wiznet_send_command(emac_wiznet_t *emac, uint8_t command, uint32_t timeout_ms)
 {
     esp_err_t ret = ESP_OK;
     const wiznet_chip_ops_t *ops = emac->ops;

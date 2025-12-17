@@ -49,6 +49,16 @@ typedef struct {
 static bool is_w5500_sane_for_rxtx(emac_wiznet_t *emac);
 
 static const wiznet_chip_ops_t w5500_ops = {
+    /* Register translation table for common registers */
+    .regs = {
+        [WIZNET_REG_MAC_ADDR]        = W5500_REG_MAC,
+        [WIZNET_REG_SOCK_MR]         = W5500_REG_SOCK_MR(0),
+        [WIZNET_REG_SOCK_IMR]        = W5500_REG_SOCK_IMR(0),
+        [WIZNET_REG_SOCK_RXBUF_SIZE] = W5500_REG_SOCK_RXBUF_SIZE(0),
+        [WIZNET_REG_SOCK_TXBUF_SIZE] = W5500_REG_SOCK_TXBUF_SIZE(0),
+        [WIZNET_REG_INT_LEVEL]       = W5500_REG_INTLEVEL,
+    },
+
     /* Socket 0 registers (pre-computed addresses) */
     .reg_sock_cr = W5500_REG_SOCK_CR(0),
     .reg_sock_ir = W5500_REG_SOCK_IR(0),
@@ -68,11 +78,16 @@ static const wiznet_chip_ops_t w5500_ops = {
     /* Command values */
     .cmd_send = W5500_SCR_SEND,
     .cmd_recv = W5500_SCR_RECV,
+    .cmd_open = W5500_SCR_OPEN,
+    .cmd_close = W5500_SCR_CLOSE,
 
     /* Interrupt bits */
     .sir_send = W5500_SIR_SEND,
     .sir_recv = W5500_SIR_RECV,
     .simr_sock0 = W5500_SIMR_SOCK0,
+
+    /* Bit masks */
+    .smr_mac_filter = W5500_SMR_MAC_FILTER,
 
     /* Callbacks */
     .is_sane_for_rxtx = is_w5500_sane_for_rxtx,
@@ -82,54 +97,22 @@ static bool is_w5500_sane_for_rxtx(emac_wiznet_t *emac)
 {
     uint8_t phycfg;
     /* phy is ok for rx and tx operations if bits RST and LNK are set (no link down, no reset) */
-    if (emac->spi.read(emac->spi.ctx, (W5500_REG_PHYCFGR >> 16), (W5500_REG_PHYCFGR & 0xFFFF), &phycfg, 1) == ESP_OK 
+    if (wiznet_read(emac, W5500_REG_PHYCFGR, &phycfg, 1) == ESP_OK 
         && (phycfg & 0x8001)) {
         return true;
     }
     return false;
 }
 
-static esp_err_t w5500_read(emac_w5500_t *emac, uint32_t address, void *data, uint32_t len)
-{
-    uint32_t cmd = (address >> W5500_ADDR_OFFSET); // Actually it's the address phase in W5500 SPI frame
-    uint32_t addr = ((address & 0xFFFF) | (W5500_ACCESS_MODE_READ << W5500_RWB_OFFSET)
-                     | W5500_SPI_OP_MODE_VDM); // Actually it's the command phase in W5500 SPI frame
-
-    return emac->base.spi.read(emac->base.spi.ctx, cmd, addr, data, len);
-}
-
-static esp_err_t w5500_write(emac_w5500_t *emac, uint32_t address, const void *data, uint32_t len)
-{
-    uint32_t cmd = (address >> W5500_ADDR_OFFSET); // Actually it's the address phase in W5500 SPI frame
-    uint32_t addr = ((address & 0xFFFF) | (W5500_ACCESS_MODE_WRITE << W5500_RWB_OFFSET)
-                     | W5500_SPI_OP_MODE_VDM); // Actually it's the command phase in W5500 SPI frame
-
-    return emac->base.spi.write(emac->base.spi.ctx, cmd, addr, data, len);
-}
-
-static esp_err_t w5500_send_command(emac_w5500_t *emac, uint8_t command, uint32_t timeout_ms)
-{
-    esp_err_t ret = ESP_OK;
-    ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_SOCK_CR(0), &command, sizeof(command)), err, TAG, "write SCR failed");
-    // after W5500 accepts the command, the command register will be cleared automatically
-    uint32_t to = 0;
-    for (to = 0; to < timeout_ms / 10; to++) {
-        ESP_GOTO_ON_ERROR(w5500_read(emac, W5500_REG_SOCK_CR(0), &command, sizeof(command)), err, TAG, "read SCR failed");
-        if (!command) {
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    ESP_GOTO_ON_FALSE(to < timeout_ms / 10, ESP_ERR_TIMEOUT, err, TAG, "send command timeout");
-
-err:
-    return ret;
-}
+/* Helper macros to cast emac_w5500_t* to emac_wiznet_t* for wiznet_* functions */
+#define W5500_READ(emac, addr, data, len)   wiznet_read(&(emac)->base, (addr), (data), (len))
+#define W5500_WRITE(emac, addr, data, len)  wiznet_write(&(emac)->base, (addr), (data), (len))
+#define W5500_SEND_CMD(emac, cmd, tmo)      wiznet_send_command(&(emac)->base, (cmd), (tmo))
 
 static esp_err_t w5500_set_mac_addr(emac_w5500_t *emac)
 {
     esp_err_t ret = ESP_OK;
-    ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_MAC, emac->base.addr, 6), err, TAG, "write MAC address register failed");
+    ESP_GOTO_ON_ERROR(W5500_WRITE(emac, W5500_REG_MAC, emac->base.addr, 6), err, TAG, "write MAC address register failed");
 err:
     return ret;
 }
@@ -139,10 +122,10 @@ static esp_err_t w5500_reset(emac_w5500_t *emac)
     esp_err_t ret = ESP_OK;
     /* software reset */
     uint8_t mr = W5500_MR_RST; // Set RST bit (auto clear)
-    ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_MR, &mr, sizeof(mr)), err, TAG, "write MR failed");
+    ESP_GOTO_ON_ERROR(W5500_WRITE(emac, W5500_REG_MR, &mr, sizeof(mr)), err, TAG, "write MR failed");
     uint32_t to = 0;
     for (to = 0; to < emac->base.sw_reset_timeout_ms / 10; to++) {
-        ESP_GOTO_ON_ERROR(w5500_read(emac, W5500_REG_MR, &mr, sizeof(mr)), err, TAG, "read MR failed");
+        ESP_GOTO_ON_ERROR(W5500_READ(emac, W5500_REG_MR, &mr, sizeof(mr)), err, TAG, "read MR failed");
         if (!(mr & W5500_MR_RST)) {
             break;
         }
@@ -165,7 +148,7 @@ static esp_err_t w5500_verify_id(emac_w5500_t *emac)
     ESP_LOGD(TAG, "Waiting W5500 to start & verify version...");
     uint32_t to = 0;
     for (to = 0; to < emac->base.sw_reset_timeout_ms / 10; to++) {
-        ESP_GOTO_ON_ERROR(w5500_read(emac, W5500_REG_VERSIONR, &version, sizeof(version)), err, TAG, "read VERSIONR failed");
+        ESP_GOTO_ON_ERROR(W5500_READ(emac, W5500_REG_VERSIONR, &version, sizeof(version)), err, TAG, "read VERSIONR failed");
         if (version == W5500_CHIP_VERSION) {
             return ESP_OK;
         }
@@ -185,29 +168,29 @@ static esp_err_t w5500_setup_default(emac_w5500_t *emac)
 
     // Only SOCK0 can be used as MAC RAW mode, so we give the whole buffer (16KB TX and 16KB RX) to SOCK0, which doesn't have any effect for TX though.
     // A larger TX buffer doesn't buy us pipelining - each SEND is one frame and must complete before the next.
-    ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_SOCK_RXBUF_SIZE(0), &reg_value, sizeof(reg_value)), err, TAG, "set rx buffer size failed");
-    ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_SOCK_TXBUF_SIZE(0), &reg_value, sizeof(reg_value)), err, TAG, "set tx buffer size failed");
+    ESP_GOTO_ON_ERROR(W5500_WRITE(emac, W5500_REG_SOCK_RXBUF_SIZE(0), &reg_value, sizeof(reg_value)), err, TAG, "set rx buffer size failed");
+    ESP_GOTO_ON_ERROR(W5500_WRITE(emac, W5500_REG_SOCK_TXBUF_SIZE(0), &reg_value, sizeof(reg_value)), err, TAG, "set tx buffer size failed");
     reg_value = 0;
     for (int i = 1; i < 8; i++) {
-        ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_SOCK_RXBUF_SIZE(i), &reg_value, sizeof(reg_value)), err, TAG, "set rx buffer size failed");
-        ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_SOCK_TXBUF_SIZE(i), &reg_value, sizeof(reg_value)), err, TAG, "set tx buffer size failed");
+        ESP_GOTO_ON_ERROR(W5500_WRITE(emac, W5500_REG_SOCK_RXBUF_SIZE(i), &reg_value, sizeof(reg_value)), err, TAG, "set rx buffer size failed");
+        ESP_GOTO_ON_ERROR(W5500_WRITE(emac, W5500_REG_SOCK_TXBUF_SIZE(i), &reg_value, sizeof(reg_value)), err, TAG, "set tx buffer size failed");
     }
 
     /* Enable ping block, disable PPPoE, WOL */
     reg_value = W5500_MR_PB;
-    ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_MR, &reg_value, sizeof(reg_value)), err, TAG, "write MR failed");
+    ESP_GOTO_ON_ERROR(W5500_WRITE(emac, W5500_REG_MR, &reg_value, sizeof(reg_value)), err, TAG, "write MR failed");
     /* Disable interrupt for all sockets by default */
     reg_value = 0;
-    ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_SIMR, &reg_value, sizeof(reg_value)), err, TAG, "write SIMR failed");
+    ESP_GOTO_ON_ERROR(W5500_WRITE(emac, W5500_REG_SIMR, &reg_value, sizeof(reg_value)), err, TAG, "write SIMR failed");
     /* Enable MAC RAW mode for SOCK0, enable MAC filter, no blocking broadcast and block multicast */
     reg_value = W5500_SMR_MAC_RAW | W5500_SMR_MAC_FILTER | W5500_SMR_MAC_BLOCK_MCAST;
-    ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_SOCK_MR(0), &reg_value, sizeof(reg_value)), err, TAG, "write SMR failed");
+    ESP_GOTO_ON_ERROR(W5500_WRITE(emac, W5500_REG_SOCK_MR(0), &reg_value, sizeof(reg_value)), err, TAG, "write SMR failed");
     /* Enable receive event for SOCK0 */
     reg_value = W5500_SIR_RECV;
-    ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_SOCK_IMR(0), &reg_value, sizeof(reg_value)), err, TAG, "write SOCK0 IMR failed");
+    ESP_GOTO_ON_ERROR(W5500_WRITE(emac, W5500_REG_SOCK_IMR(0), &reg_value, sizeof(reg_value)), err, TAG, "write SOCK0 IMR failed");
     /* Set the interrupt re-assert level to maximum (~1.5ms) to lower the chances of missing it */
     uint16_t int_level = __builtin_bswap16(0xFFFF);
-    ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_INTLEVEL, &int_level, sizeof(int_level)), err, TAG, "write INTLEVEL failed");
+    ESP_GOTO_ON_ERROR(W5500_WRITE(emac, W5500_REG_INTLEVEL, &int_level, sizeof(int_level)), err, TAG, "write INTLEVEL failed");
 
 err:
     return ret;
@@ -219,10 +202,10 @@ static esp_err_t emac_w5500_start(esp_eth_mac_t *mac)
     emac_w5500_t *emac = __containerof(mac, emac_w5500_t, base.parent);
     uint8_t reg_value = 0;
     /* open SOCK0 */
-    ESP_GOTO_ON_ERROR(w5500_send_command(emac, W5500_SCR_OPEN, 100), err, TAG, "issue OPEN command failed");
+    ESP_GOTO_ON_ERROR(W5500_SEND_CMD(emac, W5500_SCR_OPEN, 100), err, TAG, "issue OPEN command failed");
     /* enable interrupt for SOCK0 */
     reg_value = W5500_SIMR_SOCK0;
-    ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_SIMR, &reg_value, sizeof(reg_value)), err, TAG, "write SIMR failed");
+    ESP_GOTO_ON_ERROR(W5500_WRITE(emac, W5500_REG_SIMR, &reg_value, sizeof(reg_value)), err, TAG, "write SIMR failed");
 
 err:
     return ret;
@@ -234,9 +217,9 @@ static esp_err_t emac_w5500_stop(esp_eth_mac_t *mac)
     emac_w5500_t *emac = __containerof(mac, emac_w5500_t, base.parent);
     uint8_t reg_value = 0;
     /* disable interrupt */
-    ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_SIMR, &reg_value, sizeof(reg_value)), err, TAG, "write SIMR failed");
+    ESP_GOTO_ON_ERROR(W5500_WRITE(emac, W5500_REG_SIMR, &reg_value, sizeof(reg_value)), err, TAG, "write SIMR failed");
     /* close SOCK0 */
-    ESP_GOTO_ON_ERROR(w5500_send_command(emac, W5500_SCR_CLOSE, 100), err, TAG, "issue CLOSE command failed");
+    ESP_GOTO_ON_ERROR(W5500_SEND_CMD(emac, W5500_SCR_CLOSE, 100), err, TAG, "issue CLOSE command failed");
 
 err:
     return ret;
@@ -249,7 +232,7 @@ static esp_err_t emac_w5500_write_phy_reg(esp_eth_mac_t *mac, uint32_t phy_addr,
     // PHY register and MAC registers are mixed together in W5500
     // The only PHY register is PHYCFGR
     ESP_GOTO_ON_FALSE(phy_reg == W5500_REG_PHYCFGR, ESP_FAIL, err, TAG, "wrong PHY register");
-    ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_PHYCFGR, &reg_value, sizeof(uint8_t)), err, TAG, "write PHY register failed");
+    ESP_GOTO_ON_ERROR(W5500_WRITE(emac, W5500_REG_PHYCFGR, &reg_value, sizeof(uint8_t)), err, TAG, "write PHY register failed");
 
 err:
     return ret;
@@ -263,7 +246,7 @@ static esp_err_t emac_w5500_read_phy_reg(esp_eth_mac_t *mac, uint32_t phy_addr, 
     // PHY register and MAC registers are mixed together in W5500
     // The only PHY register is PHYCFGR
     ESP_GOTO_ON_FALSE(phy_reg == W5500_REG_PHYCFGR, ESP_FAIL, err, TAG, "wrong PHY register");
-    ESP_GOTO_ON_ERROR(w5500_read(emac, W5500_REG_PHYCFGR, reg_value, sizeof(uint8_t)), err, TAG, "read PHY register failed");
+    ESP_GOTO_ON_ERROR(W5500_READ(emac, W5500_REG_PHYCFGR, reg_value, sizeof(uint8_t)), err, TAG, "read PHY register failed");
 
 err:
     return ret;
@@ -286,13 +269,13 @@ static esp_err_t emac_w5500_set_block_ip4_mcast(esp_eth_mac_t *mac, bool block)
     esp_err_t ret = ESP_OK;
     emac_w5500_t *emac = __containerof(mac, emac_w5500_t, base.parent);
     uint8_t smr;
-    ESP_GOTO_ON_ERROR(w5500_read(emac, W5500_REG_SOCK_MR(0), &smr, sizeof(smr)), err, TAG, "read SMR failed");
+    ESP_GOTO_ON_ERROR(W5500_READ(emac, W5500_REG_SOCK_MR(0), &smr, sizeof(smr)), err, TAG, "read SMR failed");
     if (block) {
         smr |= W5500_SMR_MAC_BLOCK_MCAST;
     } else {
         smr &= ~W5500_SMR_MAC_BLOCK_MCAST;
     }
-    ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_SOCK_MR(0), &smr, sizeof(smr)), err, TAG, "write SMR failed");
+    ESP_GOTO_ON_ERROR(W5500_WRITE(emac, W5500_REG_SOCK_MR(0), &smr, sizeof(smr)), err, TAG, "write SMR failed");
 err:
     return ret;
 }
@@ -362,13 +345,13 @@ static esp_err_t emac_w5500_set_promiscuous(esp_eth_mac_t *mac, bool enable)
     esp_err_t ret = ESP_OK;
     emac_w5500_t *emac = __containerof(mac, emac_w5500_t, base.parent);
     uint8_t smr = 0;
-    ESP_GOTO_ON_ERROR(w5500_read(emac, W5500_REG_SOCK_MR(0), &smr, sizeof(smr)), err, TAG, "read SMR failed");
+    ESP_GOTO_ON_ERROR(W5500_READ(emac, W5500_REG_SOCK_MR(0), &smr, sizeof(smr)), err, TAG, "read SMR failed");
     if (enable) {
         smr &= ~W5500_SMR_MAC_FILTER;
     } else {
         smr |= W5500_SMR_MAC_FILTER;
     }
-    ESP_GOTO_ON_ERROR(w5500_write(emac, W5500_REG_SOCK_MR(0), &smr, sizeof(smr)), err, TAG, "write SMR failed");
+    ESP_GOTO_ON_ERROR(W5500_WRITE(emac, W5500_REG_SOCK_MR(0), &smr, sizeof(smr)), err, TAG, "write SMR failed");
 
 err:
     return ret;
