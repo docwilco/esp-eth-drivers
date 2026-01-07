@@ -428,6 +428,44 @@ err:
  * Common Transmit/Receive Implementation
  ******************************************************************************/
 
+/**
+ * @brief Wait for pending TX to complete (SENDOK)
+ *
+ * If a previous transmit is pending, poll until SENDOK is received.
+ * This implements TX pipelining - we can prepare the next packet while
+ * the previous one is being transmitted on the wire.
+ */
+static esp_err_t wiznet_wait_tx_done(emac_wiznet_t *emac)
+{
+    if (!emac->tx_pending) {
+        return ESP_OK;
+    }
+
+    const wiznet_chip_ops_t *ops = emac->ops;
+    uint8_t status = 0;
+
+    while (true) {
+        ESP_RETURN_ON_ERROR(wiznet_read(emac, ops->reg_sock_ir, &status, sizeof(status)), emac->tag, "read SOCK0 IR failed");
+
+        if (status & ops->sir_send) {
+            break;
+        }
+
+        uint64_t now = esp_timer_get_time();
+        if (!wiznet_is_link_up(emac) || (now - emac->tx_start_time) > emac->tx_tmo) {
+            emac->tx_pending = false;
+            return ESP_FAIL;
+        }
+    }
+
+    // clear the event bit
+    status = ops->sir_send;
+    ESP_RETURN_ON_ERROR(wiznet_write(emac, ops->reg_sock_irclr, &status, sizeof(status)), emac->tag, "write SOCK0 IRCLR failed");
+    emac->tx_pending = false;
+
+    return ESP_OK;
+}
+
 esp_err_t emac_wiznet_transmit(esp_eth_mac_t *mac, uint8_t *buf, uint32_t length)
 {
     esp_err_t ret = ESP_OK;
@@ -444,29 +482,22 @@ esp_err_t emac_wiznet_transmit(esp_eth_mac_t *mac, uint8_t *buf, uint32_t length
     // get current write pointer
     ESP_GOTO_ON_ERROR(wiznet_read(emac, ops->reg_sock_tx_wr, &offset, sizeof(offset)), err, emac->tag, "read TX WR failed");
     offset = __builtin_bswap16(offset);
-    // copy data to tx memory
+    // copy data to tx memory (can happen while previous packet is being transmitted)
     ESP_GOTO_ON_ERROR(wiznet_write_buffer(emac, buf, length, offset), err, emac->tag, "write frame failed");
     // update write pointer
     offset += length;
     offset = __builtin_bswap16(offset);
     ESP_GOTO_ON_ERROR(wiznet_write(emac, ops->reg_sock_tx_wr, &offset, sizeof(offset)), err, emac->tag, "write TX WR failed");
+
+    // Wait for previous TX to complete before issuing new SEND command
+    ESP_GOTO_ON_ERROR(wiznet_wait_tx_done(emac), err, emac->tag, "wait for previous TX failed");
+
     // issue SEND command
     ESP_GOTO_ON_ERROR(wiznet_send_command(emac, ops->cmd_send, 100), err, emac->tag, "issue SEND command failed");
 
-    // polling the TX done event
-    uint8_t status = 0;
-    uint64_t start = esp_timer_get_time();
-    uint64_t now = 0;
-    do {
-        now = esp_timer_get_time();
-        if (!wiznet_is_link_up(emac) || (now - start) > emac->tx_tmo) {
-            return ESP_FAIL;
-        }
-        ESP_GOTO_ON_ERROR(wiznet_read(emac, ops->reg_sock_ir, &status, sizeof(status)), err, emac->tag, "read SOCK0 IR failed");
-    } while (!(status & ops->sir_send));
-    // clear the event bit
-    status = ops->sir_send;
-    ESP_GOTO_ON_ERROR(wiznet_write(emac, ops->reg_sock_irclr, &status, sizeof(status)), err, emac->tag, "write SOCK0 IRCLR failed");
+    // Mark TX as pending and record when SEND was issued for timeout calculation
+    emac->tx_pending = true;
+    emac->tx_start_time = esp_timer_get_time();
 
 err:
     return ret;

@@ -144,6 +144,8 @@ struct emac_wiznet_s {
     bool packets_remain;            /*!< Flag indicating more packets in RX buffer */
     uint8_t *rx_buffer;             /*!< RX buffer for incoming frames */
     uint32_t tx_tmo;                /*!< TX timeout in microseconds (speed-dependent) */
+    bool tx_pending;                /*!< Flag indicating a TX is in progress (pipelining) */
+    uint64_t tx_start_time;         /*!< Timestamp when SEND command was issued */
 };
 
 /**
