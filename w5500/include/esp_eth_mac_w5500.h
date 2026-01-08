@@ -26,7 +26,7 @@ typedef struct {
     eth_spi_custom_driver_config_t custom_spi_driver;   /*!< Custom SPI driver definitions */
     int rx_buffer_size;                                 /*!< RX buffer size in bytes for bulk reading from chip.
                                                              Defaults to chip's full RX buffer (16KB) if 0.
-                                                             Minimum effective size is 1520 bytes (one max frame).
+                                                             Minimum effective size is 1524 bytes (one max frame + header).
                                                              Larger buffers reduce SPI transaction overhead. */
 } eth_w5500_config_t;
 

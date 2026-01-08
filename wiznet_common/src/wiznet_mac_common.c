@@ -515,68 +515,15 @@ err:
     return ret;
 }
 
-typedef struct {
-    uint32_t offset;
-    uint32_t copy_len;
-    uint32_t rx_len;
-    uint32_t remain;
-} __attribute__((packed)) emac_wiznet_auto_buf_info_t;
-
-#define WIZNET_ETH_MAC_RX_BUF_SIZE_AUTO (0)
-
 esp_err_t emac_wiznet_receive(esp_eth_mac_t *mac, uint8_t *buf, uint32_t *length)
 {
-    esp_err_t ret = ESP_OK;
-    emac_wiznet_t *emac = __containerof(mac, emac_wiznet_t, parent);
-    const wiznet_chip_ops_t *ops = emac->ops;
-    uint16_t offset = 0;
-    uint16_t rx_len = 0;
-    uint16_t copy_len = 0;
-    uint16_t remain_bytes = 0;
-    emac->packets_remain = false;
-
-    if (*length != WIZNET_ETH_MAC_RX_BUF_SIZE_AUTO) {
-        wiznet_get_rx_received_size(emac, &remain_bytes);
-        if (remain_bytes) {
-            // get current read pointer
-            ESP_GOTO_ON_ERROR(wiznet_read(emac, ops->reg_sock_rx_rd, &offset, sizeof(offset)), err, emac->tag, "read RX RD failed");
-            offset = __builtin_bswap16(offset);
-            // read head first
-            ESP_GOTO_ON_ERROR(wiznet_read_buffer(emac, &rx_len, sizeof(rx_len), offset), err, emac->tag, "read frame header failed");
-            rx_len = __builtin_bswap16(rx_len) - 2; // data size includes 2 bytes of header
-            // frames larger than expected will be truncated
-            copy_len = rx_len > *length ? *length : rx_len;
-        } else {
-            // silently return when no frame is waiting
-            goto err;
-        }
-    } else {
-        emac_wiznet_auto_buf_info_t *buff_info = (emac_wiznet_auto_buf_info_t *)buf;
-        offset = buff_info->offset;
-        copy_len = buff_info->copy_len;
-        rx_len = buff_info->rx_len;
-        remain_bytes = buff_info->remain;
-    }
-    // 2 bytes of header
-    offset += 2;
-    // read the payload
-    ESP_GOTO_ON_ERROR(wiznet_read_buffer(emac, emac->rx_buffer, copy_len, offset), err, emac->tag, "read payload failed, len=%" PRIu16 ", offset=%" PRIu16, rx_len, offset);
-    memcpy(buf, emac->rx_buffer, copy_len);
-    offset += rx_len;
-    // update read pointer
-    offset = __builtin_bswap16(offset);
-    ESP_GOTO_ON_ERROR(wiznet_write(emac, ops->reg_sock_rx_rd, &offset, sizeof(offset)), err, emac->tag, "write RX RD failed");
-    /* issue RECV command */
-    ESP_GOTO_ON_ERROR(wiznet_send_command(emac, ops->cmd_recv, 100), err, emac->tag, "issue RECV command failed");
-    // check if there're more data need to process
-    remain_bytes -= rx_len + 2;
-    emac->packets_remain = remain_bytes > 0;
-
-    *length = copy_len;
-    return ret;
-err:
+    /* This driver uses bulk reads internally. Packet reception is handled
+     * entirely within emac_wiznet_task() which calls stack_input() directly.
+     * External calls to receive() are not supported. */
+    (void)mac;
+    (void)buf;
     *length = 0;
-    return ret;
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 /**
@@ -650,19 +597,27 @@ void emac_wiznet_task(void *arg)
         }
 
         /* read interrupt status */
-        wiznet_read(emac, ops->reg_sock_ir, &status, sizeof(status));
+        if (wiznet_read(emac, ops->reg_sock_ir, &status, sizeof(status)) != ESP_OK) {
+            ESP_LOGE(emac->tag, "read SOCK0 IR failed");
+            continue;
+        }
 
         /* packet received */
         if (status & ops->sir_recv) {
             /* clear interrupt status */
             uint8_t clr = ops->sir_recv;
-            wiznet_write(emac, ops->reg_sock_irclr, &clr, sizeof(clr));
+            if (wiznet_write(emac, ops->reg_sock_irclr, &clr, sizeof(clr)) != ESP_OK) {
+                ESP_LOGE(emac->tag, "write SOCK0 IRCLR failed");
+            }
 
             /* Bulk read loop - keep reading until chip buffer is empty */
             while (1) {
                 /* Get available bytes from chip */
                 uint16_t available = 0;
-                wiznet_get_rx_received_size(emac, &available);
+                if (wiznet_get_rx_received_size(emac, &available) != ESP_OK) {
+                    ESP_LOGE(emac->tag, "get RX received size failed");
+                    break;
+                }
                 if (available == 0) {
                     break;  /* Nothing more to read */
                 }
@@ -688,19 +643,31 @@ void emac_wiznet_task(void *arg)
 
                 /* Get read pointer */
                 uint16_t rd_ptr = 0;
-                wiznet_read(emac, ops->reg_sock_rx_rd, &rd_ptr, sizeof(rd_ptr));
+                if (wiznet_read(emac, ops->reg_sock_rx_rd, &rd_ptr, sizeof(rd_ptr)) != ESP_OK) {
+                    ESP_LOGE(emac->tag, "read RX RD failed");
+                    break;
+                }
                 rd_ptr = __builtin_bswap16(rd_ptr);
 
                 /* Bulk read into buffer */
-                wiznet_read_buffer(emac, emac->rx_buffer + emac->rx_buffer_len, to_read, rd_ptr);
+                if (wiznet_read_buffer(emac, emac->rx_buffer + emac->rx_buffer_len, to_read, rd_ptr) != ESP_OK) {
+                    ESP_LOGE(emac->tag, "read RX buffer failed");
+                    break;
+                }
 
                 /* Update read pointer */
                 rd_ptr += to_read;
                 uint16_t rd_ptr_be = __builtin_bswap16(rd_ptr);
-                wiznet_write(emac, ops->reg_sock_rx_rd, &rd_ptr_be, sizeof(rd_ptr_be));
+                if (wiznet_write(emac, ops->reg_sock_rx_rd, &rd_ptr_be, sizeof(rd_ptr_be)) != ESP_OK) {
+                    ESP_LOGE(emac->tag, "write RX RD failed");
+                    break;
+                }
 
                 /* Issue RECV command immediately to free chip buffer */
-                wiznet_send_command(emac, ops->cmd_recv, 100);
+                if (wiznet_send_command(emac, ops->cmd_recv, 100) != ESP_OK) {
+                    ESP_LOGE(emac->tag, "issue RECV command failed");
+                    break;
+                }
 
                 emac->rx_buffer_len += to_read;
             }

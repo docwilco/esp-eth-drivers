@@ -455,7 +455,6 @@ static esp_eth_handle_t eth_init_spi(spi_eth_module_config_t *spi_eth_module_con
         eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(CONFIG_ETHERNET_SPI_HOST, &spi_devcfg);
         w5500_config.int_gpio_num = spi_eth_module_config->int_gpio;
         w5500_config.poll_period_ms = spi_eth_module_config->poll_period_ms;
-        w5500_config.rx_buffer_size = 4092;
         mac = esp_eth_mac_new_w5500(&w5500_config, &mac_config);
         phy = esp_eth_phy_new_w5500(&phy_config);
         (void)snprintf(dev_name, ETH_DEV_NAME_MAX_LEN, "W5500");
@@ -465,7 +464,6 @@ static esp_eth_handle_t eth_init_spi(spi_eth_module_config_t *spi_eth_module_con
         eth_w6100_config_t w6100_config = ETH_W6100_DEFAULT_CONFIG(CONFIG_ETHERNET_SPI_HOST, &spi_devcfg);
         w6100_config.int_gpio_num = spi_eth_module_config->int_gpio;
         w6100_config.poll_period_ms = spi_eth_module_config->poll_period_ms;
-        w6100_config.rx_buffer_size = 4092;
         mac = esp_eth_mac_new_w6100(&w6100_config, &mac_config);
         phy = esp_eth_phy_new_w6100(&phy_config);
         (void)snprintf(dev_name, ETH_DEV_NAME_MAX_LEN, "W6100");
