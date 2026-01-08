@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include "sdkconfig.h"
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_attr.h"
@@ -24,6 +25,7 @@
 #include "esp_rom_gpio.h"
 #endif
 #include "wiznet_mac_common.h"
+#include "wiznet_spi.h"
 
 esp_err_t emac_wiznet_set_mediator(esp_eth_mac_t *mac, esp_eth_mediator_t *eth)
 {
@@ -418,8 +420,18 @@ err:
 static esp_err_t wiznet_read_buffer(emac_wiznet_t *emac, void *buffer, uint32_t len, uint16_t offset)
 {
     esp_err_t ret = ESP_OK;
-    uint32_t addr = emac->ops->mem_sock_rx_base | (offset << 16);
-    ESP_GOTO_ON_ERROR(wiznet_read(emac, addr, buffer, len), err, emac->tag, "read RX buffer failed");
+    uint8_t *buf_ptr = (uint8_t *)buffer;
+    uint32_t remaining = len;
+    uint32_t max_chunk = emac->spi_max_transfer_sz;
+
+    while (remaining > 0) {
+        uint32_t chunk = (remaining > max_chunk) ? max_chunk : remaining;
+        uint32_t addr = emac->ops->mem_sock_rx_base | ((uint32_t)offset << 16);
+        ESP_GOTO_ON_ERROR(wiznet_read(emac, addr, buf_ptr, chunk), err, emac->tag, "read RX buffer failed");
+        buf_ptr += chunk;
+        offset += chunk;  /* Note: offset wraps naturally within 16-bit range (chip buffer is circular) */
+        remaining -= chunk;
+    }
 err:
     return ret;
 }
@@ -512,45 +524,6 @@ typedef struct {
 
 #define WIZNET_ETH_MAC_RX_BUF_SIZE_AUTO (0)
 
-static esp_err_t emac_wiznet_alloc_recv_buf(emac_wiznet_t *emac, uint8_t **buf, uint32_t *length)
-{
-    esp_err_t ret = ESP_OK;
-    const wiznet_chip_ops_t *ops = emac->ops;
-    uint16_t offset = 0;
-    uint16_t rx_len = 0;
-    uint32_t copy_len = 0;
-    uint16_t remain_bytes = 0;
-    *buf = NULL;
-
-    wiznet_get_rx_received_size(emac, &remain_bytes);
-    if (remain_bytes) {
-        // get current read pointer
-        ESP_GOTO_ON_ERROR(wiznet_read(emac, ops->reg_sock_rx_rd, &offset, sizeof(offset)), err, emac->tag, "read RX RD failed");
-        offset = __builtin_bswap16(offset);
-        // read head
-        ESP_GOTO_ON_ERROR(wiznet_read_buffer(emac, &rx_len, sizeof(rx_len), offset), err, emac->tag, "read frame header failed");
-        rx_len = __builtin_bswap16(rx_len) - 2; // data size includes 2 bytes of header
-        // frames larger than expected will be truncated
-        copy_len = rx_len > *length ? *length : rx_len;
-        // runt frames are not forwarded, but check the length anyway since it could be corrupted at SPI bus
-        ESP_GOTO_ON_FALSE(copy_len >= ETH_MIN_PACKET_SIZE - ETH_CRC_LEN, ESP_ERR_INVALID_SIZE, err, emac->tag, "invalid frame length %" PRIu32, copy_len);
-        *buf = malloc(copy_len);
-        if (*buf != NULL) {
-            emac_wiznet_auto_buf_info_t *buff_info = (emac_wiznet_auto_buf_info_t *)*buf;
-            buff_info->offset = offset;
-            buff_info->copy_len = copy_len;
-            buff_info->rx_len = rx_len;
-            buff_info->remain = remain_bytes;
-        } else {
-            ret = ESP_ERR_NO_MEM;
-            goto err;
-        }
-    }
-err:
-    *length = rx_len;
-    return ret;
-}
-
 esp_err_t emac_wiznet_receive(esp_eth_mac_t *mac, uint8_t *buf, uint32_t *length)
 {
     esp_err_t ret = ESP_OK;
@@ -606,35 +579,57 @@ err:
     return ret;
 }
 
-static esp_err_t emac_wiznet_flush_recv_frame(emac_wiznet_t *emac)
+/**
+ * @brief Process complete packets from RX buffer
+ *
+ * Parses all complete packets from the bulk-read buffer and passes them to
+ * the network stack. Returns the number of bytes processed (complete packets).
+ * Caller should memmove remaining bytes to front of buffer.
+ */
+static uint32_t wiznet_process_rx_buffer(emac_wiznet_t *emac)
 {
-    esp_err_t ret = ESP_OK;
-    const wiznet_chip_ops_t *ops = emac->ops;
-    uint16_t offset = 0;
-    uint16_t rx_len = 0;
-    uint16_t remain_bytes = 0;
-    emac->packets_remain = false;
+    uint8_t *buf_ptr = emac->rx_buffer;
+    uint32_t processed = 0;
 
-    wiznet_get_rx_received_size(emac, &remain_bytes);
-    if (remain_bytes) {
-        // get current read pointer
-        ESP_GOTO_ON_ERROR(wiznet_read(emac, ops->reg_sock_rx_rd, &offset, sizeof(offset)), err, emac->tag, "read RX RD failed");
-        offset = __builtin_bswap16(offset);
-        // read head first
-        ESP_GOTO_ON_ERROR(wiznet_read_buffer(emac, &rx_len, sizeof(rx_len), offset), err, emac->tag, "read frame header failed");
-        // update read pointer
-        rx_len = __builtin_bswap16(rx_len);
-        offset += rx_len;
-        offset = __builtin_bswap16(offset);
-        ESP_GOTO_ON_ERROR(wiznet_write(emac, ops->reg_sock_rx_rd, &offset, sizeof(offset)), err, emac->tag, "write RX RD failed");
-        /* issue RECV command */
-        ESP_GOTO_ON_ERROR(wiznet_send_command(emac, ops->cmd_recv, 100), err, emac->tag, "issue RECV command failed");
-        // check if there're more data need to process
-        remain_bytes -= rx_len;
-        emac->packets_remain = remain_bytes > 0;
+    while (emac->rx_buffer_len - processed >= 2) {
+        /* Read packet length from 2-byte header (big-endian) */
+        uint16_t pkt_total = (buf_ptr[0] << 8) | buf_ptr[1];
+        uint16_t pkt_len = pkt_total - 2;  /* Data length excludes 2-byte header */
+
+        /* Check if we have complete packet */
+        if (emac->rx_buffer_len - processed < pkt_total) {
+            break;  /* Partial packet, wait for more data */
+        }
+
+        /* Validate packet length */
+        if (pkt_len < ETH_MIN_PACKET_SIZE - ETH_CRC_LEN) {
+            ESP_LOGE(emac->tag, "runt frame length %" PRIu16, pkt_len);
+            buf_ptr += pkt_total;
+            processed += pkt_total;
+            continue;
+        }
+        if (pkt_len > ETH_MAX_PACKET_SIZE) {
+            ESP_LOGE(emac->tag, "oversized frame length %" PRIu16, pkt_len);
+            buf_ptr += pkt_total;
+            processed += pkt_total;
+            continue;
+        }
+
+        /* Allocate buffer for stack */
+        uint8_t *pkt_buf = malloc(pkt_len);
+        if (pkt_buf) {
+            memcpy(pkt_buf, buf_ptr + 2, pkt_len);
+            ESP_LOGD(emac->tag, "receive len=%" PRIu16, pkt_len);
+            emac->eth->stack_input(emac->eth, pkt_buf, pkt_len);
+        } else {
+            ESP_LOGE(emac->tag, "no mem for packet buffer (%" PRIu16 " bytes)", pkt_len);
+        }
+
+        buf_ptr += pkt_total;
+        processed += pkt_total;
     }
-err:
-    return ret;
+
+    return processed;
 }
 
 void emac_wiznet_task(void *arg)
@@ -642,59 +637,83 @@ void emac_wiznet_task(void *arg)
     emac_wiznet_t *emac = (emac_wiznet_t *)arg;
     const wiznet_chip_ops_t *ops = emac->ops;
     uint8_t status = 0;
-    uint8_t *buffer = NULL;
-    uint32_t frame_len = 0;
-    uint32_t buf_len = 0;
-    esp_err_t ret;
+
     while (1) {
         /* check if the task receives any notification */
-        if (emac->int_gpio_num >= 0) {                                    // if in interrupt mode
-            if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000)) == 0 &&     // if no notification ...
-                    gpio_get_level(emac->int_gpio_num) != 0) {            // ...and no interrupt asserted
-                continue;                                                 // -> just continue to check again
+        if (emac->int_gpio_num >= 0) {                                    /* interrupt mode */
+            if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000)) == 0 &&     /* no notification ... */
+                    gpio_get_level(emac->int_gpio_num) != 0) {            /* ...and no interrupt asserted */
+                continue;                                                 /* -> just continue to check again */
             }
         } else {
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         }
+
         /* read interrupt status */
         wiznet_read(emac, ops->reg_sock_ir, &status, sizeof(status));
+
         /* packet received */
         if (status & ops->sir_recv) {
             /* clear interrupt status */
             uint8_t clr = ops->sir_recv;
             wiznet_write(emac, ops->reg_sock_irclr, &clr, sizeof(clr));
-            do {
-                /* define max expected frame len */
-                frame_len = ETH_MAX_PACKET_SIZE;
-                if ((ret = emac_wiznet_alloc_recv_buf(emac, &buffer, &frame_len)) == ESP_OK) {
-                    if (buffer != NULL) {
-                        /* we have memory to receive the frame of maximal size previously defined */
-                        buf_len = WIZNET_ETH_MAC_RX_BUF_SIZE_AUTO;
-                        if (emac->parent.receive(&emac->parent, buffer, &buf_len) == ESP_OK) {
-                            if (buf_len == 0) {
-                                free(buffer);
-                            } else if (frame_len > buf_len) {
-                                ESP_LOGE(emac->tag, "received frame was truncated");
-                                free(buffer);
-                            } else {
-                                ESP_LOGD(emac->tag, "receive len=%" PRIu32, buf_len);
-                                /* pass the buffer to stack (e.g. TCP/IP layer) */
-                                emac->eth->stack_input(emac->eth, buffer, buf_len);
-                            }
-                        } else {
-                            ESP_LOGE(emac->tag, "frame read from module failed");
-                            free(buffer);
-                        }
-                    } else if (frame_len) {
-                        ESP_LOGE(emac->tag, "invalid combination of frame_len(%" PRIu32 ") and buffer pointer(%p)", frame_len, buffer);
-                    }
-                } else if (ret == ESP_ERR_NO_MEM) {
-                    ESP_LOGE(emac->tag, "no mem for receive buffer");
-                    emac_wiznet_flush_recv_frame(emac);
-                } else {
-                    ESP_LOGE(emac->tag, "unexpected error 0x%x", ret);
+
+            /* Bulk read loop - keep reading until chip buffer is empty */
+            while (1) {
+                /* Get available bytes from chip */
+                uint16_t available = 0;
+                wiznet_get_rx_received_size(emac, &available);
+                if (available == 0) {
+                    break;  /* Nothing more to read */
                 }
-            } while (emac->packets_remain);
+
+                /* Calculate how much we can read into our buffer */
+                uint32_t space = emac->rx_buffer_size - emac->rx_buffer_len;
+                uint32_t to_read = (available < space) ? available : space;
+
+                if (to_read == 0) {
+                    /* Buffer full but chip has more data - shouldn't happen with
+                     * proper buffer sizing, but process what we have first */
+                    ESP_LOGD(emac->tag, "RX buffer full, processing before reading more");
+                    uint32_t processed = wiznet_process_rx_buffer(emac);
+                    if (processed > 0) {
+                        uint32_t remaining = emac->rx_buffer_len - processed;
+                        if (remaining > 0) {
+                            memmove(emac->rx_buffer, emac->rx_buffer + processed, remaining);
+                        }
+                        emac->rx_buffer_len = remaining;
+                    }
+                    continue;  /* Try reading again with freed space */
+                }
+
+                /* Get read pointer */
+                uint16_t rd_ptr = 0;
+                wiznet_read(emac, ops->reg_sock_rx_rd, &rd_ptr, sizeof(rd_ptr));
+                rd_ptr = __builtin_bswap16(rd_ptr);
+
+                /* Bulk read into buffer */
+                wiznet_read_buffer(emac, emac->rx_buffer + emac->rx_buffer_len, to_read, rd_ptr);
+
+                /* Update read pointer */
+                rd_ptr += to_read;
+                uint16_t rd_ptr_be = __builtin_bswap16(rd_ptr);
+                wiznet_write(emac, ops->reg_sock_rx_rd, &rd_ptr_be, sizeof(rd_ptr_be));
+
+                /* Issue RECV command immediately to free chip buffer */
+                wiznet_send_command(emac, ops->cmd_recv, 100);
+
+                emac->rx_buffer_len += to_read;
+            }
+
+            /* Process all complete packets from buffer */
+            uint32_t processed = wiznet_process_rx_buffer(emac);
+
+            /* Move any remaining partial packet to front of buffer */
+            uint32_t remaining = emac->rx_buffer_len - processed;
+            if (remaining > 0 && processed > 0) {
+                memmove(emac->rx_buffer, emac->rx_buffer + processed, remaining);
+            }
+            emac->rx_buffer_len = remaining;
         }
     }
     vTaskDelete(NULL);
@@ -834,6 +853,8 @@ esp_err_t emac_wiznet_init_common(emac_wiznet_t *emac,
         /* Custom SPI driver device init */
         ESP_GOTO_ON_FALSE((emac->spi.ctx = emac->spi.init(wiznet_config->custom_spi_driver.config)) != NULL,
                           ESP_FAIL, err, tag, "SPI initialization failed");
+        /* Custom drivers must handle chunking themselves or use sufficiently large max_transfer_sz */
+        emac->spi_max_transfer_sz = UINT32_MAX;
     } else {
         ESP_LOGD(tag, "Using default SPI Driver");
         emac->spi.init = wiznet_spi_init;
@@ -843,6 +864,12 @@ esp_err_t emac_wiznet_init_common(emac_wiznet_t *emac,
         /* SPI device init */
         ESP_GOTO_ON_FALSE((emac->spi.ctx = emac->spi.init(wiznet_config)) != NULL,
                           ESP_FAIL, err, tag, "SPI initialization failed");
+        /* Probe the SPI bus to find the actual max transfer size */
+        uint32_t probe_min = ETH_MAX_PACKET_SIZE + 2;  // Minimum to hold one full frame
+        uint32_t probe_max = (ops->chip_rx_buffer_size > 0) ? ops->chip_rx_buffer_size : 16384;
+        emac->spi_max_transfer_sz = wiznet_spi_probe_max_transfer_sz(emac->spi.ctx, probe_min, probe_max);
+        ESP_GOTO_ON_FALSE(emac->spi_max_transfer_sz > 0, ESP_FAIL, err, tag,
+                          "SPI max transfer size probe failed - check SPI bus configuration");
     }
 
     /* create rx task */
@@ -854,8 +881,27 @@ esp_err_t emac_wiznet_init_common(emac_wiznet_t *emac,
                                                    mac_config->rx_task_prio, &emac->rx_task_hdl, core_num);
     ESP_GOTO_ON_FALSE(xReturned == pdPASS, ESP_FAIL, err, tag, "create rx task failed");
 
+    /* Calculate RX buffer size:
+     * - If rx_buffer_size is 0 (default), use chip's hardware buffer size
+     * - Otherwise, use configured size but cap at chip buffer size
+     * - Minimum is ETH_MAX_PACKET_SIZE + 2 to hold at least one full frame
+     */
+    if (wiznet_config->rx_buffer_size > 0) {
+        emac->rx_buffer_size = wiznet_config->rx_buffer_size;
+        if (ops->chip_rx_buffer_size > 0 && emac->rx_buffer_size > ops->chip_rx_buffer_size) {
+            emac->rx_buffer_size = ops->chip_rx_buffer_size;
+        }
+    } else {
+        emac->rx_buffer_size = (ops->chip_rx_buffer_size > 0) ? ops->chip_rx_buffer_size : ETH_MAX_PACKET_SIZE;
+    }
+    /* Ensure minimum size for at least one frame (including 2-byte length header) */
+    if (emac->rx_buffer_size < ETH_MAX_PACKET_SIZE + 2) {
+        emac->rx_buffer_size = ETH_MAX_PACKET_SIZE + 2;
+    }
+    ESP_LOGD(tag, "RX buffer size: %" PRIu32 " bytes", emac->rx_buffer_size);
+
     /* allocate RX buffer */
-    emac->rx_buffer = heap_caps_malloc(ETH_MAX_PACKET_SIZE, MALLOC_CAP_DMA);
+    emac->rx_buffer = heap_caps_malloc(emac->rx_buffer_size, MALLOC_CAP_DMA);
     ESP_GOTO_ON_FALSE(emac->rx_buffer, ESP_ERR_NO_MEM, err, tag, "RX buffer allocation failed");
 
     /* create poll timer if needed */

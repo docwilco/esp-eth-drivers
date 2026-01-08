@@ -102,6 +102,9 @@ typedef struct {
     uint32_t reg_phy_status;        /*!< PHY status register address */
     uint8_t phy_link_mask;          /*!< Mask to check link status in PHY status register */
 
+    /* Buffer sizes */
+    uint32_t chip_rx_buffer_size;   /*!< Chip's hardware RX buffer size (e.g., 16KB for W5500/W6100) */
+
     /* Chip-specific function pointers */
     esp_err_t (*reset)(emac_wiznet_t *emac);        /*!< Chip-specific software reset */
     esp_err_t (*verify_id)(emac_wiznet_t *emac);    /*!< Verify chip ID/version */
@@ -142,7 +145,10 @@ struct emac_wiznet_s {
     uint32_t poll_period_ms;        /*!< Poll period in milliseconds */
     uint8_t addr[6];                /*!< MAC address (ETH_ADDR_LEN) */
     bool packets_remain;            /*!< Flag indicating more packets in RX buffer */
-    uint8_t *rx_buffer;             /*!< RX buffer for incoming frames */
+    uint8_t *rx_buffer;             /*!< RX buffer for incoming frames (bulk read) */
+    uint32_t rx_buffer_size;        /*!< Size of RX buffer in bytes */
+    uint32_t rx_buffer_len;         /*!< Bytes of unprocessed data in RX buffer */
+    uint32_t spi_max_transfer_sz;   /*!< Maximum SPI transfer size in bytes */
     uint32_t tx_tmo;                /*!< TX timeout in microseconds (speed-dependent) */
     bool tx_pending;                /*!< Flag indicating a TX is in progress (pipelining) */
     uint64_t tx_start_time;         /*!< Timestamp when SEND command was issued */
@@ -459,6 +465,7 @@ typedef struct {
     spi_host_device_t spi_host_id;                      /*!< SPI peripheral */
     spi_device_interface_config_t *spi_devcfg;          /*!< SPI device configuration */
     eth_spi_custom_driver_config_t custom_spi_driver;   /*!< Custom SPI driver definitions */
+    int rx_buffer_size;                                 /*!< RX buffer size in bytes */
 } eth_wiznet_config_t;
 
 /**

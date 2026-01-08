@@ -85,6 +85,9 @@ static const wiznet_chip_ops_t w6100_ops = {
     .reg_phy_status = W6100_REG_PHYSR,
     .phy_link_mask = W6100_PHYSR_LNK,
 
+    /* Buffer sizes */
+    .chip_rx_buffer_size = 16384,  /* W6100 has 16KB RX buffer for socket 0 */
+
     /* Chip-specific functions */
     .reset = w6100_reset,
     .verify_id = w6100_verify_id,

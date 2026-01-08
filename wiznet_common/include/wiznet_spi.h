@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2024-2025 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2024-2026 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -78,6 +78,19 @@ esp_err_t wiznet_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void *data
  * @return ESP_OK on success, ESP_FAIL or ESP_ERR_TIMEOUT on failure
  */
 esp_err_t wiznet_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr, const void *data, uint32_t len);
+
+/**
+ * @brief Probe the maximum SPI transfer size supported by the bus
+ *
+ * Uses binary search to find the largest transfer size that succeeds.
+ * This allows auto-detection of the SPI bus DMA limits.
+ *
+ * @param spi_ctx SPI context
+ * @param min_size Lower bound / minimum required size (e.g., ETH_MAX_PACKET_SIZE + 2)
+ * @param max_size Upper bound to probe (e.g., chip's buffer size)
+ * @return Maximum transfer size in bytes, or 0 if min_size cannot be satisfied
+ */
+uint32_t wiznet_spi_probe_max_transfer_sz(void *spi_ctx, uint32_t min_size, uint32_t max_size);
 
 #ifdef __cplusplus
 }

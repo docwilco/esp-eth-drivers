@@ -75,6 +75,9 @@ static const wiznet_chip_ops_t w5500_ops = {
     .reg_phy_status = W5500_REG_PHYCFGR,
     .phy_link_mask = W5500_PHYCFGR_LNK,  /* Check link status bit */
 
+    /* Buffer sizes */
+    .chip_rx_buffer_size = 16384,  /* W5500 has 16KB RX buffer for socket 0 */
+
     /* Chip-specific functions */
     .reset = w5500_reset,
     .verify_id = w5500_verify_id,
